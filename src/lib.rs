@@ -1,0 +1,56 @@
+//! An embeddable, high-performance code editor component for Zgui applications.
+//!
+//! One [`Editor`] component renders any buffer — up to millions of lines — through a single
+//! retained element that paints only what is visible, shapes each line once, and scrolls to
+//! pixel precision with its own `f64` scroll model. Syntax highlighting is tree-sitter,
+//! incremental, computed on a background worker and delivered per visible line.
+//!
+//! # Driving it
+//!
+//! Everything is a [`Command`], applied through the [`EditorHandle`] the component hands to
+//! `on_ready` (and provides as local context). The handle also answers synchronous reads
+//! through [`EditorHandle::query`] and publishes signals for status lines and scrollbars.
+//! Key handling is layered: an application's `on_key` filter hears every key first — which is
+//! how a vim mode is built *outside* this crate (see `examples/vim`) — and whatever it declines
+//! falls through to the default keymap.
+//!
+//! # Theming
+//!
+//! Colours are CSS custom properties, inherited like any other: `--editor-bg` is the element's
+//! own `background`, the text is its `color`, and the rest are `--editor-selection`,
+//! `--editor-cursor`, `--editor-cursor-text`, `--editor-current-line`, `--editor-gutter-bg`,
+//! `--editor-gutter-fg`, `--editor-gutter-current-fg`, `--editor-scrollbar-thumb`,
+//! `--editor-scrollbar-track`, and one `--syntax-<capture>` per highlight capture name with
+//! dots written as hyphens (`--syntax-function-method`), falling back along the dots and then
+//! to the foreground. Fonts, `tab-size` and `cursor` are ordinary CSS on the element.
+//!
+//! # What is not there yet
+//!
+//! Input methods do not compose over the editor — see [`ime`] for the platform limitation and
+//! the upstream path. Lines do not soft-wrap; long lines scroll horizontally.
+
+#![warn(missing_docs)]
+#![forbid(unsafe_code)]
+
+pub mod command;
+pub mod config;
+pub mod core;
+pub mod event;
+pub mod handle;
+pub mod ime;
+pub mod input;
+pub mod render;
+pub mod scroll;
+pub mod syntax;
+mod view;
+
+pub use crate::command::{Clipboard, Command, InsertPoint, Motion, ScrollCmd};
+pub use crate::config::{CursorStyle, EditorConfig, GutterMode};
+pub use crate::core::edit::EditKind;
+pub use crate::core::search::SearchDirection;
+pub use crate::core::selection::{Selection, Selections};
+pub use crate::core::{EditOptions, EditorState};
+pub use crate::event::{EditorEvent, KeyFilter};
+pub use crate::handle::{CaretRect, CursorPos, EditorHandle, EditorSnapshot, ScrollSnapshot};
+pub use crate::syntax::registry::{LanguageConfig, LanguageRegistry};
+pub use crate::view::{Editor, EditorProps};

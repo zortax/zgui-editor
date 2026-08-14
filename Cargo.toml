@@ -1,0 +1,59 @@
+[package]
+name = "zgui-editor"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "An embeddable, high-performance code editor component for Zgui applications"
+repository = "https://github.com/zortax/zgui-editor"
+keywords = ["editor", "code", "zgui", "tree-sitter"]
+categories = ["gui", "text-editors"]
+authors = ["Leonard Seibold <git@zrtx.de>"]
+
+[dependencies]
+zgui = { git = "https://github.com/zortax/zgui" }
+# `LineRequest::families` is `&[Ident]`, and the umbrella crate does not re-export the type.
+zgui-interned = { git = "https://github.com/zortax/zgui" }
+# Reading the colours a style sheet set, which the umbrella crate does not re-export either.
+zgui-css = { git = "https://github.com/zortax/zgui" }
+# Lowering the computed style's font properties to the shaper's vocabulary.
+zgui-text-style = { git = "https://github.com/zortax/zgui" }
+ropey = "1.6"
+tree-sitter = "0.26"
+streaming-iterator = "0.1"
+unicode-segmentation = "1"
+unicode-width = "0.2"
+rustc-hash = "2"
+smallvec = "1"
+compact_str = "0.10"
+flume = { version = "0.12", default-features = false, features = ["async"] }
+
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-toml-ng = { version = "0.7", optional = true }
+tree-sitter-md = { version = "0.5", optional = true }
+
+[features]
+default = []
+# Bundled grammars, one feature per language so an application ships only what it uses.
+lang-rust = ["dep:tree-sitter-rust"]
+lang-toml = ["dep:tree-sitter-toml-ng"]
+lang-markdown = ["dep:tree-sitter-md"]
+all-languages = ["lang-rust", "lang-toml", "lang-markdown"]
+
+[dev-dependencies]
+zgui-testkit-view = { git = "https://github.com/zortax/zgui" }
+zgui-testkit-scene = { git = "https://github.com/zortax/zgui" }
+zgui-platform-headless = { git = "https://github.com/zortax/zgui" }
+zgui-layout = { git = "https://github.com/zortax/zgui" }
+
+[[example]]
+name = "basic"
+required-features = ["lang-rust"]
+
+[[example]]
+name = "vim"
+path = "examples/vim/main.rs"
+required-features = ["lang-rust"]
+
+[[example]]
+name = "completion"
+required-features = ["lang-rust"]
