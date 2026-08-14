@@ -24,6 +24,13 @@
 //! dots written as hyphens (`--syntax-function-method`), falling back along the dots and then
 //! to the foreground. Fonts, `tab-size` and `cursor` are ordinary CSS on the element.
 //!
+//! # Marking the text
+//!
+//! An application draws on the buffer through [`decoration`]: named layers of bands, underlines
+//! and gutter marks, each naming a custom property of its own so a diagnostic or a search hit is
+//! themed where everything else is. [`EditorHandle::point_for_byte`] turns a byte into a place on
+//! the window, which is what a hover card, an inline diagnostic or a leap label is positioned by.
+//!
 //! # What is not there yet
 //!
 //! Input methods do not compose over the editor — see [`ime`] for the platform limitation and
@@ -35,6 +42,7 @@
 pub mod command;
 pub mod config;
 pub mod core;
+pub mod decoration;
 pub mod event;
 pub mod handle;
 pub mod ime;
@@ -46,10 +54,11 @@ mod view;
 
 pub use crate::command::{Clipboard, Command, InsertPoint, Motion, ScrollCmd};
 pub use crate::config::{CursorStyle, EditorConfig, GutterMode};
-pub use crate::core::edit::EditKind;
+pub use crate::core::edit::{EditKind, TextChange};
 pub use crate::core::search::SearchDirection;
 pub use crate::core::selection::{Selection, Selections};
 pub use crate::core::{EditOptions, EditorState};
+pub use crate::decoration::{Decoration, DecorationKind, GutterMark, Paint, UnderlineStyle};
 pub use crate::event::{EditorEvent, KeyFilter};
 pub use crate::handle::{CaretRect, CursorPos, EditorHandle, EditorSnapshot, ScrollSnapshot};
 pub use crate::syntax::registry::{LanguageConfig, LanguageRegistry};

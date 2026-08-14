@@ -16,13 +16,14 @@ pub mod selection;
 pub mod words;
 
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Instant;
 
 use ropey::Rope;
 
 use crate::command::{Clipboard, Command, InsertPoint, ScrollCmd};
 use crate::core::buffer::Buffer;
-use crate::core::edit::{Edit, EditKind, Transaction};
+use crate::core::edit::{Edit, EditKind, TextChange, Transaction};
 use crate::core::history::History;
 use crate::core::motion::MotionContext;
 use crate::core::selection::{Selection, Selections};
@@ -64,6 +65,12 @@ pub struct ChangeInfo {
     pub first_changed_line: usize,
     /// The edits as tree-sitter takes them, in the order they were applied.
     pub input_edits: Vec<tree_sitter::InputEdit>,
+    /// The same edits as an application takes them, in the same order.
+    ///
+    /// Shared rather than owned because every view attached to the document is told about the
+    /// change and the report goes out to the application beside them; one allocation serves all
+    /// of them, and a keystroke's report should cost a refcount.
+    pub changes: Arc<[TextChange]>,
     /// What kind of change it was.
     pub kind: EditKind,
 }
@@ -130,6 +137,9 @@ impl EditorState {
             change: Some(ChangeInfo {
                 first_changed_line: 0,
                 input_edits: Vec::new(),
+                // A whole new text is not a list of edits anybody can apply on top of the old
+                // one; a consumer that synchronises incrementally has to resend the document.
+                changes: Arc::from([] as [TextChange; 0]),
                 kind: EditKind::Other,
             }),
             selection_changed: true,
@@ -477,12 +487,14 @@ impl EditorState {
             .map(|edit| position::line_of(&before_rope, edit.range.start))
             .unwrap_or(0);
         let input_edits = tx.input_edits(&before_rope);
+        let changes: Arc<[TextChange]> = Arc::from(tx.changes());
         self.history.push(tx);
 
         Response {
             change: Some(ChangeInfo {
                 first_changed_line,
                 input_edits,
+                changes,
                 kind,
             }),
             selection_changed: true,
@@ -622,11 +634,13 @@ impl EditorState {
             return Response::nothing();
         };
         let mut input_edits = Vec::new();
+        let mut changes: Vec<TextChange> = Vec::new();
         let mut first_changed_line = usize::MAX;
         for tx in step.transactions.iter().rev() {
             let inverted = tx.invert();
             let before_rope = self.buffer.rope().clone();
             input_edits.extend(inverted.input_edits(&before_rope));
+            changes.extend(inverted.changes());
             if let Some(edit) = inverted.edits.last() {
                 first_changed_line =
                     first_changed_line.min(position::line_of(&before_rope, edit.range.start));
@@ -646,6 +660,7 @@ impl EditorState {
                     first_changed_line
                 },
                 input_edits,
+                changes: Arc::from(changes),
                 kind: EditKind::Other,
             }),
             selection_changed: true,
@@ -660,10 +675,12 @@ impl EditorState {
             return Response::nothing();
         };
         let mut input_edits = Vec::new();
+        let mut changes: Vec<TextChange> = Vec::new();
         let mut first_changed_line = usize::MAX;
         for tx in &step.transactions {
             let before_rope = self.buffer.rope().clone();
             input_edits.extend(tx.input_edits(&before_rope));
+            changes.extend(tx.changes());
             if let Some(edit) = tx.edits.last() {
                 first_changed_line =
                     first_changed_line.min(position::line_of(&before_rope, edit.range.start));
@@ -683,6 +700,7 @@ impl EditorState {
                     first_changed_line
                 },
                 input_edits,
+                changes: Arc::from(changes),
                 kind: EditKind::Other,
             }),
             selection_changed: true,
@@ -710,6 +728,75 @@ mod tests {
 
     fn apply(editor: &mut EditorState, command: Command) -> Response {
         editor.apply(&command, NO_VIEW)
+    }
+
+    #[test]
+    fn a_change_reports_what_it_replaced() {
+        // The report is what a language server synchronises from, so it has to describe the edit
+        // in the coordinates of the text the edit applied to — not the text that came out.
+        let mut editor = editor("hello world");
+        apply(
+            &mut editor,
+            Command::Move {
+                motion: Motion::WordForward { big: false },
+                count: 1,
+                extend: false,
+            },
+        );
+        let response = apply(&mut editor, Command::Insert("brave ".to_string()));
+        let change = response.change.expect("the text changed");
+        assert_eq!(change.changes.len(), 1);
+        assert_eq!(change.changes[0].range, 6..6);
+        assert_eq!(change.changes[0].text, "brave ");
+        assert_eq!(editor.buffer.rope().to_string(), "hello brave world");
+    }
+
+    #[test]
+    fn a_deletion_reports_the_bytes_it_took() {
+        let mut editor = editor("hello world");
+        apply(
+            &mut editor,
+            Command::SetSelections {
+                selections: vec![Selection::new(0, 6)],
+                primary: 0,
+            },
+        );
+        let response = apply(&mut editor, Command::DeleteSelection);
+        let change = response.change.expect("the text changed");
+        assert_eq!(change.changes.len(), 1);
+        assert_eq!(change.changes[0].range, 0..6);
+        assert_eq!(change.changes[0].text, "");
+    }
+
+    #[test]
+    fn undo_reports_the_change_that_puts_the_text_back() {
+        let mut editor = editor("abc");
+        apply(&mut editor, Command::Insert("X".to_string()));
+        let response = apply(&mut editor, Command::Undo);
+        let change = response.change.expect("undo changed the text");
+        assert_eq!(change.changes.len(), 1);
+        // Addressed in the changed text: the X that was inserted is what comes back out.
+        assert_eq!(change.changes[0].range, 0..1);
+        assert_eq!(change.changes[0].text, "");
+        assert_eq!(editor.buffer.rope().to_string(), "abc");
+    }
+
+    #[test]
+    fn several_carets_report_several_changes_in_the_order_they_applied() {
+        // Descending by start, which is the order that needs no offset fixing on the far side.
+        let mut editor = editor("a\nb\n");
+        apply(
+            &mut editor,
+            Command::SetSelections {
+                selections: vec![Selection::caret(0), Selection::caret(2)],
+                primary: 0,
+            },
+        );
+        let response = apply(&mut editor, Command::Insert(">".to_string()));
+        let change = response.change.expect("the text changed");
+        let starts: Vec<usize> = change.changes.iter().map(|c| c.range.start).collect();
+        assert_eq!(starts, [2, 0]);
+        assert_eq!(editor.buffer.rope().to_string(), ">a\n>b\n");
     }
 
     #[test]

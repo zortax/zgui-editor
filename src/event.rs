@@ -1,6 +1,8 @@
 //! What the editor reports, and how an application intercepts its keys.
 
-use crate::core::edit::EditKind;
+use std::sync::Arc;
+
+use crate::core::edit::{EditKind, TextChange};
 
 /// What is asked about a key before the editor interprets it.
 ///
@@ -21,6 +23,13 @@ pub enum EditorEvent {
         kind: EditKind,
         /// The revision the buffer now has.
         revision: u64,
+        /// The replacements that made the change, in the order they applied.
+        ///
+        /// Empty when the whole text was replaced through
+        /// [`set_text`](crate::EditorHandle::set_text): that is not a change anything can apply
+        /// on top of what it already held, so a consumer that synchronises incrementally — a
+        /// language server — resends the document instead.
+        changes: Arc<[TextChange]>,
     },
     /// The selections moved without the text changing.
     SelectionMoved,

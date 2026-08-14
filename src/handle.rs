@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use zgui::platform::ClipboardKind;
 use zgui::prelude::*;
@@ -19,6 +20,7 @@ use crate::core::motion::{self, MotionContext};
 use crate::core::search::SearchDirection;
 use crate::core::selection::{Selection, Selections};
 use crate::core::{EditorState, Response, ScrollEffect, position, search, words};
+use crate::decoration::{Decoration, GutterMark};
 use crate::event::EditorEvent;
 use crate::render::element::EditorElement;
 use crate::render::shared::EditorShared;
@@ -61,9 +63,37 @@ pub struct CaretRect {
 pub struct EditorSnapshot<'a> {
     state: &'a EditorState,
     context: MotionContext,
+    visible: Range<usize>,
 }
 
 impl EditorSnapshot<'_> {
+    /// The lines any part of which is on screen.
+    ///
+    /// What bounds work that is only worth doing for what can be seen: labelling leap targets,
+    /// laying out inline diagnostics, highlighting search matches.
+    pub fn visible_lines(&self) -> Range<usize> {
+        self.visible.clone()
+    }
+
+    /// The bytes any part of which is on screen.
+    ///
+    /// Empty while the editor has not been laid out yet, which is also when there is nothing to
+    /// see. Half-open, and clamped to the text — the caller can slice the rope with it directly.
+    pub fn visible_byte_range(&self) -> Range<usize> {
+        let rope = self.state.buffer.rope();
+        if self.visible.is_empty() {
+            return 0..0;
+        }
+        let start = position::line_start(rope, self.visible.start);
+        let last = self.visible.end.saturating_sub(1);
+        let end = if last + 1 >= position::line_count(rope) {
+            rope.len_bytes()
+        } else {
+            position::line_start(rope, last + 1)
+        };
+        start..end.max(start)
+    }
+
     /// The text. Cloning the rope is O(1).
     pub fn rope(&self) -> &ropey::Rope {
         self.state.buffer.rope()
@@ -217,6 +247,7 @@ impl EditorHandle {
         let snapshot = EditorSnapshot {
             state: &shared.state,
             context: shared.motion_context(),
+            visible: shared.visible_lines(),
         };
         read(&snapshot)
     }
@@ -286,6 +317,65 @@ impl EditorHandle {
         self.ctx.element.repaint();
     }
 
+    /// Replaces the decorations in the layer called `layer`.
+    ///
+    /// Layers are independent: a language server replacing its diagnostics leaves the search
+    /// highlight alone, and neither has to know the other exists. An empty list clears the layer
+    /// without forgetting where it sits in the painting order, so the next set of diagnostics
+    /// paints under the same things the last set did.
+    ///
+    /// Setting a layer to what it already holds costs nothing, which is what makes it reasonable
+    /// to re-set the search highlight on every keystroke of an incremental search.
+    pub fn set_decorations(&self, layer: &str, decorations: Vec<Decoration>) {
+        let (changed, needs_style) = {
+            let mut shared = self.ctx.shared.borrow_mut();
+            let changed = shared.decorations.set(layer, decorations);
+            (changed, changed && shared.decorations_need_style())
+        };
+        self.after_marks(changed, needs_style);
+    }
+
+    /// Removes the layer called `layer` and everything in it.
+    pub fn clear_decorations(&self, layer: &str) {
+        let changed = self.ctx.shared.borrow_mut().decorations.clear(layer);
+        self.after_marks(changed, false);
+    }
+
+    /// Replaces the gutter marks in the layer called `layer`.
+    ///
+    /// The same layering as [`set_decorations`](Self::set_decorations), in the gutter's own
+    /// padding: a mark never moves a line number and never widens the gutter.
+    pub fn set_gutter_marks(&self, layer: &str, marks: Vec<GutterMark>) {
+        let (changed, needs_style) = {
+            let mut shared = self.ctx.shared.borrow_mut();
+            let changed = shared.gutter_marks.set(layer, marks);
+            (changed, changed && shared.decorations_need_style())
+        };
+        self.after_marks(changed, needs_style);
+    }
+
+    /// Removes the gutter-mark layer called `layer`.
+    pub fn clear_gutter_marks(&self, layer: &str) {
+        let changed = self.ctx.shared.borrow_mut().gutter_marks.clear(layer);
+        self.after_marks(changed, false);
+    }
+
+    /// Asks for whatever a changed set of marks needs.
+    ///
+    /// A mark naming a colour the last layout never read has to wait for the style to be read
+    /// again; anything else is a repaint, which is what an incremental search wants a keystroke
+    /// to cost.
+    fn after_marks(&self, changed: bool, needs_style: bool) {
+        if !changed {
+            return;
+        }
+        if needs_style {
+            self.ctx.element.relayout();
+        } else {
+            self.ctx.element.repaint();
+        }
+    }
+
     /// Changes what the caret looks like — a vim layer's mode change.
     pub fn set_cursor_style(&self, style: CursorStyle) {
         self.ctx.shared.borrow_mut().config.cursor_style = style;
@@ -327,6 +417,41 @@ impl EditorHandle {
     /// scrolled out of view.
     pub fn caret_rect(&self) -> Signal<Option<CaretRect>, LocalStorage> {
         self.ctx.signals.caret_rect.into()
+    }
+
+    /// Where `byte` sits on the window, in CSS pixels. `None` when its line is not on screen.
+    ///
+    /// The one call that turns a position in the text into a place on the screen, which is what
+    /// anything drawn *at* a piece of code needs: a hover card over a symbol, a diagnostic beside
+    /// the token it is about, the label a leap motion puts on each candidate. The rectangle is a
+    /// caret's — as wide as the caret, as tall as the line — so a surface anchored to it lines up
+    /// with the text rather than with the element.
+    ///
+    /// Geometry is the completed frame's, so this answers about where things were drawn last, not
+    /// where a command issued in this same turn will put them.
+    pub fn point_for_byte(&self, byte: usize) -> Option<CaretRect> {
+        let mut shared = self.ctx.shared.borrow_mut();
+        self.point_in(&mut shared, byte)
+    }
+
+    /// Which byte a place on the window lands on, in CSS pixels. `None` when it is outside.
+    ///
+    /// The inverse of [`point_for_byte`](Self::point_for_byte), and what a click in a decoration
+    /// an application drew over the editor has to be turned back into.
+    pub fn byte_for_point(&self, x: f32, y: f32) -> Option<usize> {
+        let bounds = self.ctx.port.bounds()?;
+        let mut shared = self.ctx.shared.borrow_mut();
+        let scale = shared.metrics.scale.max(0.001);
+        let local_x = x * scale - bounds.origin.x.0;
+        let local_y = y * scale - bounds.origin.y.0;
+        if local_x < 0.0
+            || local_y < 0.0
+            || local_x > shared.viewport.0
+            || local_y > shared.viewport.1
+        {
+            return None;
+        }
+        Some(shared.hit_test(local_x, local_y))
     }
 
     /// Scans the whole buffer for its longest line on a worker, so the horizontal scroll
@@ -479,6 +604,7 @@ impl EditorHandle {
                 tell(EditorEvent::Edited {
                     kind: change.kind,
                     revision: self.ctx.shared.borrow().state.buffer.revision(),
+                    changes: Arc::clone(&change.changes),
                 });
             } else if response.selection_changed {
                 tell(EditorEvent::SelectionMoved);
@@ -610,7 +736,12 @@ impl EditorHandle {
     /// Where the primary caret sits on the window right now, when it is visible.
     fn caret_rect_now(&self, shared: &mut EditorShared) -> Option<CaretRect> {
         let head = shared.state.selections.primary().head;
-        let (line, x) = shared.caret_position(head);
+        self.point_in(shared, head)
+    }
+
+    /// Where `byte` sits on the window, given a view already borrowed.
+    fn point_in(&self, shared: &mut EditorShared, byte: usize) -> Option<CaretRect> {
+        let (line, x) = shared.caret_position(byte);
         if !shared.visible_lines().contains(&line) {
             return None;
         }

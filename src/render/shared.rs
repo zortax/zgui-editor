@@ -8,6 +8,9 @@
 use std::ops::Range;
 use std::rc::Rc;
 
+use compact_str::CompactString;
+use zgui::elements::kurbo;
+
 use zgui::app::Shaper;
 use zgui::canvas::zgui_color::Color;
 use zgui::custom::{PaintSlot, ScenePainter, ShapedRun};
@@ -18,6 +21,7 @@ use zgui_interned::Ident;
 use crate::config::{CursorStyle, EditorConfig, GutterMode};
 use crate::core::motion::MotionContext;
 use crate::core::{EditorState, position};
+use crate::decoration::{Decoration, DecorationKind, GutterMark, Layers, Paint, UnderlineStyle};
 use crate::render::line_cache::{self, CachedLine, LineCache};
 use crate::render::metrics::TextMetrics;
 use crate::render::shaping::ShapingCache;
@@ -64,6 +68,16 @@ pub struct EditorShared {
     pub lines: LineCache,
     /// What the highlighter has said so far.
     pub syntax: SyntaxState,
+    /// Marks the application drew on the text.
+    pub decorations: Layers<Decoration>,
+    /// Marks the application drew in the gutter.
+    pub gutter_marks: Layers<GutterMark>,
+    /// The colours those marks named, as the style sheet answers for them.
+    ///
+    /// A name present with `None` is one the sheet does not set, which is different from one that
+    /// has not been looked up yet — and the difference is what tells a decoration that named a
+    /// new property that it has to wait for a layout before it can be drawn in its own colour.
+    pub decoration_colors: rustc_hash::FxHashMap<String, Option<Color>>,
     /// The way to the syntax worker, once one runs.
     pub syntax_tx: Option<flume::Sender<crate::syntax::worker::ToWorker>>,
     /// The visible range last asked of the worker, so scrolling asks again only when it must.
@@ -103,6 +117,9 @@ impl EditorShared {
             shaping: ShapingCache::new(),
             lines: LineCache::default(),
             syntax: SyntaxState::default(),
+            decorations: Layers::default(),
+            gutter_marks: Layers::default(),
+            decoration_colors: rustc_hash::FxHashMap::default(),
             syntax_tx: None,
             requested_window: 0..0,
             viewport: (0.0, 0.0),
@@ -289,6 +306,7 @@ impl EditorShared {
             self.theme = theme;
             self.theme_version = self.theme_version.wrapping_add(1);
         }
+        self.resolve_decoration_colors(style);
 
         if !final_pass {
             return;
@@ -323,6 +341,97 @@ impl EditorShared {
         });
         let mut held = self.families.iter();
         wanted.all(|name| held.any(|resolved| *resolved == name))
+    }
+
+    // ---- Decorations -------------------------------------------------------------------
+
+    /// Reads the colour of every custom property a decoration named off the style.
+    ///
+    /// Decorations name properties rather than carrying colours, so the set to resolve is
+    /// whatever is in the layers right now. The names are collected first because resolving
+    /// writes into the map the layers would otherwise be borrowed beside.
+    fn resolve_decoration_colors(&mut self, style: &ComputedStyle) {
+        let names: Vec<String> = self
+            .decorations
+            .iter()
+            .map(|decoration| match &decoration.kind {
+                DecorationKind::Background(paint) => paint,
+                DecorationKind::Underline { paint, .. } => paint,
+            })
+            .chain(self.gutter_marks.iter().map(|mark| &mark.paint))
+            .filter_map(|paint| match paint {
+                Paint::Property(name) => Some(name.as_ref().to_owned()),
+                Paint::Color(_) => None,
+            })
+            .collect();
+
+        self.decoration_colors.clear();
+        for name in names {
+            let color = zgui_css::values::custom::color(style, &name);
+            self.decoration_colors.insert(name, color);
+        }
+    }
+
+    /// Whether any decoration names a property that has not been looked up yet.
+    ///
+    /// True after a layer is set that mentions a colour the last layout never saw, which is the
+    /// one case where drawing has to wait for the style to be read again.
+    pub fn decorations_need_style(&self) -> bool {
+        self.decorations
+            .iter()
+            .map(|decoration| match &decoration.kind {
+                DecorationKind::Background(paint) => paint,
+                DecorationKind::Underline { paint, .. } => paint,
+            })
+            .chain(self.gutter_marks.iter().map(|mark| &mark.paint))
+            .any(|paint| match paint {
+                Paint::Property(name) => !self.decoration_colors.contains_key(name.as_ref()),
+                Paint::Color(_) => false,
+            })
+    }
+
+    /// What one decoration is drawn with.
+    ///
+    /// A property no rule set falls back to the text's own colour: a decoration nobody can see is
+    /// worse than one in the wrong colour, because only one of the two ever gets reported.
+    fn paint_color(&self, paint: &Paint) -> Color {
+        match paint {
+            Paint::Color(color) => *color,
+            Paint::Property(name) => self
+                .decoration_colors
+                .get(name.as_ref())
+                .copied()
+                .flatten()
+                .unwrap_or(self.theme.fg),
+        }
+    }
+
+    /// Where `range` sits on `line`, as x offsets inside the text area, when any of it does.
+    ///
+    /// The one piece of geometry both selections and decorations need: which part of a byte range
+    /// falls on one line, in the coordinates that line's glyphs were placed in.
+    fn extent_on_line(&mut self, range: &Range<usize>, line: usize) -> Option<(f32, f32)> {
+        let rope = self.state.buffer.rope().clone();
+        let line_start = position::line_start(&rope, line);
+        let line_end = position::line_end(&rope, line);
+        if range.start > line_end || range.end < line_start {
+            return None;
+        }
+        let cell = self.metrics.cell_advance;
+        let cached = self.ensure_line(line)?;
+        let seg_start = range.start.max(line_start);
+        let x0 = if seg_start <= line_start {
+            0.0
+        } else {
+            line_cache::caret_x(&cached.shaped, (seg_start - line_start) as u32)
+        };
+        let x1 = if range.end > line_end {
+            // The break is covered too, shown as half a cell beyond the text.
+            cached.shaped.width + cell * 0.5
+        } else {
+            line_cache::caret_x(&cached.shaped, (range.end - line_start) as u32)
+        };
+        Some((x0, x1))
     }
 
     // ---- Lines -------------------------------------------------------------------------
@@ -460,6 +569,10 @@ impl EditorShared {
             }
         }
 
+        // The bands an application asked for, under the selection so that selecting decorated
+        // text still reads as selected.
+        self.paint_decoration_bands(painter, &visible, text_x0);
+
         // Selection bands.
         let selection_color = if self.focused {
             self.theme.selection
@@ -537,6 +650,9 @@ impl EditorShared {
             }
         }
 
+        // The marks beside the numbers.
+        self.paint_gutter_marks(painter, &visible);
+
         // The text.
         for line in visible.clone() {
             let Some(cached) = self.ensure_line(line) else {
@@ -553,6 +669,9 @@ impl EditorShared {
                 painter.glyphs(&borrowed, origin, slice.color);
             }
         }
+
+        // The lines under the text, over it so a descender never hides an error.
+        self.paint_decoration_underlines(painter, &visible, text_x0);
 
         // The carets.
         if self.focused || !selections.iter().all(|s| s.is_caret()) {
@@ -603,6 +722,128 @@ impl EditorShared {
                 hits,
                 misses,
             );
+        }
+    }
+
+    /// Draws the bands an application asked for behind the text.
+    fn paint_decoration_bands(
+        &mut self,
+        painter: &mut ScenePainter<'_>,
+        visible: &Range<usize>,
+        text_x0: f32,
+    ) {
+        if self.decorations.is_empty() {
+            return;
+        }
+        let rope = self.state.buffer.rope().clone();
+        let line_height = self.metrics.line_height;
+        // Collected rather than iterated in place: drawing needs the shaped line, and shaping is
+        // a mutation of the same value the layers live in.
+        let bands: Vec<(Range<usize>, Color)> = self
+            .decorations
+            .iter()
+            .filter(|decoration| !decoration.range.is_empty())
+            .filter_map(|decoration| match &decoration.kind {
+                DecorationKind::Background(paint) => {
+                    Some((decoration.range.clone(), self.paint_color(paint)))
+                }
+                DecorationKind::Underline { .. } => None,
+            })
+            .collect();
+
+        for (range, color) in bands {
+            for line in lines_of(&rope, &range, visible) {
+                let Some((x0, x1)) = self.extent_on_line(&range, line) else {
+                    continue;
+                };
+                let y = self.line_y(line);
+                fill(
+                    painter,
+                    text_x0 + x0,
+                    y,
+                    (x1 - x0).max(1.0),
+                    line_height,
+                    color,
+                );
+            }
+        }
+    }
+
+    /// Draws the lines an application asked for under the text.
+    fn paint_decoration_underlines(
+        &mut self,
+        painter: &mut ScenePainter<'_>,
+        visible: &Range<usize>,
+        text_x0: f32,
+    ) {
+        if self.decorations.is_empty() {
+            return;
+        }
+        let rope = self.state.buffer.rope().clone();
+        let scale = self.metrics.scale.max(0.5);
+        let line_height = self.metrics.line_height;
+        let underlines: Vec<(Range<usize>, UnderlineStyle, Color)> = self
+            .decorations
+            .iter()
+            .filter(|decoration| !decoration.range.is_empty())
+            .filter_map(|decoration| match &decoration.kind {
+                DecorationKind::Underline { style, paint } => {
+                    Some((decoration.range.clone(), *style, self.paint_color(paint)))
+                }
+                DecorationKind::Background(_) => None,
+            })
+            .collect();
+
+        for (range, style, color) in underlines {
+            for line in lines_of(&rope, &range, visible) {
+                let Some((x0, x1)) = self.extent_on_line(&range, line) else {
+                    continue;
+                };
+                // Under the descenders rather than on the baseline, and inside the line box so a
+                // squiggle never bleeds into the line below.
+                let y = self.line_y(line) + line_height - 2.0 * scale;
+                let (left, right) = (text_x0 + x0, text_x0 + x1.max(x0 + 1.0));
+                match style {
+                    UnderlineStyle::Straight => {
+                        fill(painter, left, y, right - left, scale.max(1.0), color);
+                    }
+                    UnderlineStyle::Dotted | UnderlineStyle::Dashed | UnderlineStyle::Squiggly => {
+                        stroke_underline(painter, left, right, y, scale, style, color);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Draws the marks an application put beside the line numbers.
+    ///
+    /// In the gutter's leftmost cell, which is the padding the numbers already leave: a mark
+    /// therefore never moves a number and never widens the gutter.
+    fn paint_gutter_marks(&mut self, painter: &mut ScenePainter<'_>, visible: &Range<usize>) {
+        if self.gutter_marks.is_empty() || self.config.gutter == GutterMode::None {
+            return;
+        }
+        let metrics = self.metrics;
+        let marks: Vec<(usize, CompactString, Color)> = self
+            .gutter_marks
+            .iter()
+            .filter(|mark| visible.contains(&mark.line))
+            .map(|mark| (mark.line, mark.text.clone(), self.paint_color(&mark.paint)))
+            .collect();
+
+        for (line, text, color) in marks {
+            let Some(shaper) = self.shaper.as_mut() else {
+                return;
+            };
+            let shaped = self.shaping.shape(shaper, &self.families, &text, &metrics);
+            let y = self.line_y(line) + metrics.baseline - metrics.ascent;
+            for run in shaped.runs.iter() {
+                painter.glyphs(
+                    &run.as_run(PaintSlot(0)),
+                    Point::new(DevicePx(metrics.cell_advance * 0.25), DevicePx(y)),
+                    color,
+                );
+            }
         }
     }
 
@@ -711,6 +952,100 @@ impl EditorShared {
     }
 }
 
+/// Which visible lines `range` touches.
+fn lines_of(rope: &ropey::Rope, range: &Range<usize>, visible: &Range<usize>) -> Range<usize> {
+    let from = position::line_of(rope, range.start).max(visible.start);
+    let to =
+        position::line_of(rope, range.end.min(rope.len_bytes())).min(visible.end.saturating_sub(1));
+    from..to.saturating_add(1).max(from)
+}
+
+/// The outline and the stroke one underline is drawn as.
+///
+/// A wave and a dash pattern are both strokes rather than quads, so both are expressed here and
+/// drawn by the one call that can say them. Separated from the painting so that the geometry —
+/// where a squiggle's peaks land, how long a dash is — is assertable without a window.
+pub(crate) fn underline_stroke(
+    left: f32,
+    right: f32,
+    y: f32,
+    scale: f32,
+    style: UnderlineStyle,
+) -> (kurbo::BezPath, kurbo::Stroke) {
+    let width = scale.max(1.0);
+    let mut path = kurbo::BezPath::new();
+    let mut stroke = kurbo::Stroke::new(f64::from(width));
+    let (left, right, y) = (f64::from(left), f64::from(right), f64::from(y));
+
+    match style {
+        UnderlineStyle::Squiggly => {
+            // A triangle wave: a period of four device pixels at scale one reads as a squiggle at
+            // every font size an editor is used at, and costs four points per period. The peaks
+            // sit one amplitude either side of `y`, so the wave stays inside the room the caller
+            // left for it at the bottom of the line box.
+            let period = f64::from(4.0 * scale);
+            let amplitude = f64::from(1.5 * scale);
+            let mut x = left;
+            path.move_to((x, y));
+            let mut up = true;
+            while x < right {
+                let next = (x + period / 2.0).min(right);
+                path.line_to((next, if up { y - amplitude } else { y + amplitude }));
+                up = !up;
+                x = next;
+            }
+            stroke = stroke
+                .with_caps(kurbo::Cap::Round)
+                .with_join(kurbo::Join::Round);
+        }
+        UnderlineStyle::Dotted => {
+            path.move_to((left, y));
+            path.line_to((right, y));
+            let unit = f64::from(width);
+            stroke = stroke
+                .with_caps(kurbo::Cap::Round)
+                .with_dashes(0.0, [unit, unit * 2.0]);
+        }
+        UnderlineStyle::Dashed => {
+            path.move_to((left, y));
+            path.line_to((right, y));
+            let unit = f64::from(width);
+            stroke = stroke.with_dashes(0.0, [unit * 4.0, unit * 3.0]);
+        }
+        UnderlineStyle::Straight => {
+            path.move_to((left, y));
+            path.line_to((right, y));
+        }
+    }
+
+    (path, stroke)
+}
+
+/// Draws an underline that is not a plain bar, through the vector pipeline.
+///
+/// Dearer than a quad — a stroke is rasterised — which is why a straight underline is a quad and
+/// does not come here.
+fn stroke_underline(
+    painter: &mut ScenePainter<'_>,
+    left: f32,
+    right: f32,
+    y: f32,
+    scale: f32,
+    style: UnderlineStyle,
+    color: Color,
+) {
+    let (path, stroke) = underline_stroke(left, right, y, scale, style);
+    painter.shape(&zgui::canvas::Shape {
+        path: std::sync::Arc::new(path),
+        fill: None,
+        stroke: Some(zgui::canvas::Stroke {
+            paint: zgui::canvas::Paint::Solid(zgui::canvas::Ink::Solid(color)),
+            style: stroke,
+        }),
+        clips: Vec::new(),
+    });
+}
+
 /// One opaque rectangle, the quad pipeline's unit.
 fn fill(painter: &mut ScenePainter<'_>, x: f32, y: f32, width: f32, height: f32, color: Color) {
     if width <= 0.0 || height <= 0.0 {
@@ -724,4 +1059,68 @@ fn fill(painter: &mut ScenePainter<'_>, x: f32, y: f32, width: f32, height: f32,
         0.0,
         color,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use zgui::elements::kurbo::{PathEl, Shape as _};
+
+    use super::underline_stroke;
+    use crate::decoration::UnderlineStyle;
+
+    #[test]
+    fn a_squiggle_waves_inside_the_room_it_was_given() {
+        let (path, stroke) = underline_stroke(10.0, 42.0, 100.0, 1.0, UnderlineStyle::Squiggly);
+        let bounds = path.bounding_box();
+        assert!(bounds.x0 >= 10.0 && bounds.x1 <= 42.0, "{bounds:?}");
+        // One amplitude either side of the line it is under, and no further.
+        assert!((bounds.y0 - 98.5).abs() < 0.01, "{bounds:?}");
+        assert!((bounds.y1 - 101.5).abs() < 0.01, "{bounds:?}");
+        assert!(stroke.dash_pattern.is_empty(), "a wave is not dashed");
+
+        // Sixteen half-periods over thirty-two pixels, and a peak at each.
+        let peaks = path
+            .elements()
+            .iter()
+            .filter(|el| matches!(el, PathEl::LineTo(_)))
+            .count();
+        assert_eq!(peaks, 16);
+    }
+
+    #[test]
+    fn a_squiggle_over_no_width_is_one_point() {
+        // A decoration on an empty line has nowhere to wave, and must still be a path the
+        // rasteriser can take rather than a loop that never ends.
+        let (path, _) = underline_stroke(10.0, 10.0, 100.0, 1.0, UnderlineStyle::Squiggly);
+        assert_eq!(path.elements().len(), 1);
+    }
+
+    #[test]
+    fn a_squiggle_scales_with_the_display() {
+        let (one, _) = underline_stroke(0.0, 40.0, 0.0, 1.0, UnderlineStyle::Squiggly);
+        let (two, _) = underline_stroke(0.0, 40.0, 0.0, 2.0, UnderlineStyle::Squiggly);
+        assert!(
+            two.bounding_box().height() > one.bounding_box().height(),
+            "a squiggle on a doubled display is drawn twice as tall"
+        );
+    }
+
+    #[test]
+    fn dashes_and_dots_are_one_straight_line_with_a_pattern() {
+        for style in [UnderlineStyle::Dotted, UnderlineStyle::Dashed] {
+            let (path, stroke) = underline_stroke(0.0, 40.0, 5.0, 1.0, UnderlineStyle::Straight);
+            assert_eq!(path.elements().len(), 2);
+            assert!(
+                stroke.dash_pattern.is_empty(),
+                "a straight line is not dashed"
+            );
+
+            let (path, stroke) = underline_stroke(0.0, 40.0, 5.0, 1.0, style);
+            assert_eq!(path.elements().len(), 2, "{style:?} is one segment");
+            assert!(
+                !stroke.dash_pattern.is_empty(),
+                "{style:?} carries a pattern"
+            );
+        }
+    }
 }

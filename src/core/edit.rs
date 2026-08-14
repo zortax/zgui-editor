@@ -35,6 +35,20 @@ impl Edit {
     }
 }
 
+/// One replacement, as somebody outside the crate is told about it.
+///
+/// The same shape as an [`Edit`] without the replaced text, which nothing outside needs and which
+/// is only kept inside so that a transaction can be inverted. A language server's incremental
+/// synchronisation is exactly this list in exactly this order, which is why the editor reports it
+/// rather than leaving it to be worked out by comparing two revisions of the rope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextChange {
+    /// The bytes replaced, in the coordinates of the text this change applied to.
+    pub range: Range<usize>,
+    /// What took their place.
+    pub text: String,
+}
+
 /// What kind of change a transaction is, which is what decides whether it folds into the
 /// undo step before it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -145,6 +159,22 @@ impl Transaction {
             delta += edit.delta();
         }
         (byte as isize + delta) as usize
+    }
+
+    /// The edits as a consumer outside the crate takes them, in the order they applied.
+    ///
+    /// Descending by start, the same order as [`input_edits`](Self::input_edits) and for the same
+    /// reason: when an edit applies, everything at or below its own start is still exactly as the
+    /// text before the transaction had it, so its original coordinates are the right ones at its
+    /// own application time. A consumer that applies them in this order needs no offset fixing.
+    pub fn changes(&self) -> Vec<TextChange> {
+        self.edits
+            .iter()
+            .map(|edit| TextChange {
+                range: edit.range.clone(),
+                text: edit.inserted.clone(),
+            })
+            .collect()
     }
 
     /// The edits as tree-sitter describes them, against `before`, the text they applied to.
