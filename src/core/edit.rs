@@ -49,6 +49,28 @@ pub struct TextChange {
     pub text: String,
 }
 
+/// Where `byte` of the text before a change sits in the text after it.
+///
+/// The list is the one a [`ChangeInfo`](crate::core::ChangeInfo) carries: descending by start,
+/// the order the replacements applied in. A position inside a replaced range lands at the end of
+/// what replaced it, which is where a caret that was there belongs.
+///
+/// This is what a second view of a document moves its own carets through when the first one
+/// edits.
+pub fn map_through(changes: &[TextChange], byte: usize) -> usize {
+    let mut delta = 0isize;
+    for change in changes.iter().rev() {
+        if byte < change.range.start {
+            break;
+        }
+        if byte < change.range.end {
+            return (change.range.start as isize + delta) as usize + change.text.len();
+        }
+        delta += change.text.len() as isize - (change.range.end - change.range.start) as isize;
+    }
+    (byte as isize + delta) as usize
+}
+
 /// What kind of change a transaction is, which is what decides whether it folds into the
 /// undo step before it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

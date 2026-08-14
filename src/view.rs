@@ -59,9 +59,16 @@ const GLIDE_TICK: Duration = Duration::from_millis(8);
 #[component]
 #[allow(clippy::too_many_arguments)]
 pub fn Editor(
-    /// What the buffer starts as.
+    /// What the buffer starts as. Ignored when `document` is given, which brings its own text.
     #[prop(optional, into)]
     text: Option<String>,
+    /// The buffer to show, when it is one another editor is showing too.
+    ///
+    /// Two editors given the same document are two windows onto one file: an edit in either is
+    /// the edit, either can undo it, and each keeps its own carets and its own scroll position.
+    /// Left out, the editor makes a document of its own over `text`.
+    #[prop(optional)]
+    document: Option<crate::document::Document>,
     /// The behaviour.
     #[prop(optional)]
     config: Option<EditorConfig>,
@@ -95,8 +102,10 @@ pub fn Editor(
 
     let fonts = use_context::<zgui::app::Fonts>();
     let shaper = fonts.as_ref().map(|fonts| fonts.shaper());
+    let document =
+        document.unwrap_or_else(|| crate::document::Document::new(text.as_deref().unwrap_or("")));
     let shared = Rc::new(RefCell::new(EditorShared::new(
-        text.as_deref().unwrap_or(""),
+        document.clone(),
         config.clone(),
         shaper,
     )));
@@ -109,6 +118,7 @@ pub fn Editor(
     let registry =
         registry.unwrap_or_else(|| crate::syntax::registry::LanguageRegistry::new().with_bundled());
     let handle = EditorHandle::new(
+        document.clone(),
         Rc::clone(&shared),
         element_handle.clone(),
         port,
@@ -116,6 +126,15 @@ pub fn Editor(
         on_event,
         registry,
     );
+
+    // This view registers with its document, so an edit made in another window onto the same
+    // file reaches it. The registration is weak on the document's side and given back here, so a
+    // view that goes away neither keeps its document alive nor is told about it again.
+    handle.attach_to_document();
+    {
+        let handle = handle.clone();
+        on_cleanup_local(move || handle.detach_from_document());
+    }
 
     // The syntax worker: its own thread, told about edits and the viewport, answering with
     // highlighted lines that are dropped when they describe text that has already changed.
@@ -147,7 +166,7 @@ pub fn Editor(
             if styled.get().is_some() {
                 let mut shared = handle.ctx.shared.borrow_mut();
                 // The viewport may have changed; keep the view inside the document.
-                let total = position::line_count(shared.state.buffer.rope());
+                let total = shared.line_count();
                 let viewport = shared.viewport_lines();
                 let top = shared.scroll.pos.line;
                 shared.scroll.scroll_to(top, total, viewport);
@@ -330,7 +349,7 @@ pub fn Editor(
                         height / 2.0
                     };
                     let line = bar.line_at(f64::from(y) - grab);
-                    let total = position::line_count(shared.state.buffer.rope());
+                    let total = shared.line_count();
                     let viewport = shared.viewport_lines();
                     shared.scroll.scroll_to(line, total, viewport);
                     handle.update_signals(&mut shared);
@@ -470,7 +489,7 @@ pub fn Editor(
                     let mut shared = shared.borrow_mut();
                     let bar = shared.scrollbar();
                     let line = bar.line_at(f64::from(y) - grab);
-                    let total = position::line_count(shared.state.buffer.rope());
+                    let total = shared.line_count();
                     let viewport = shared.viewport_lines();
                     shared.scroll.scroll_to(line, total, viewport);
                     handle.update_signals(&mut shared);
@@ -529,7 +548,7 @@ pub fn Editor(
                                         overshoot.abs(),
                                         f64::from(shared.metrics.line_height),
                                     ) * overshoot.signum();
-                                    let total = position::line_count(shared.state.buffer.rope());
+                                    let total = shared.line_count();
                                     let viewport = shared.viewport_lines();
                                     let target = shared.scroll.pos.line + rate * dt;
                                     shared.scroll.scroll_to(target, total, viewport);
@@ -563,7 +582,7 @@ pub fn Editor(
             match drag.borrow_mut().take() {
                 Some(Drag::Select { .. }) => {
                     cx.release_pointer();
-                    let selection = shared.borrow().state.selections.primary();
+                    let selection = shared.borrow().selections.primary();
                     if copy_on_select && !selection.is_caret() {
                         handle.command(Command::Copy(Clipboard::Primary));
                     }
@@ -591,7 +610,7 @@ pub fn Editor(
             let mut needs_glide = false;
             {
                 let mut shared = shared.borrow_mut();
-                let total = position::line_count(shared.state.buffer.rope());
+                let total = shared.line_count();
                 let viewport = shared.viewport_lines();
                 let line_height = f64::from(shared.metrics.line_height);
                 // The event is the web's `wheel`: a positive delta scrolls the view down and

@@ -73,6 +73,12 @@ pub struct ChangeInfo {
     pub changes: Arc<[TextChange]>,
     /// What kind of change it was.
     pub kind: EditKind,
+    /// Whether the whole text was replaced rather than edited.
+    ///
+    /// A replacement is not something anything holding a position can be mapped through, so
+    /// everything addressed in the old text — another view's carets, a language server's copy —
+    /// starts again rather than moving.
+    pub whole_text: bool,
 }
 
 /// What applying a command asks the view to do.
@@ -104,35 +110,60 @@ impl Response {
     }
 }
 
-/// The model: text, selections, and history.
+/// The text and its history: everything about a buffer that does not belong to one view of it.
+///
+/// A document is shared. Two windows onto the same file hold one of these between them, so an
+/// edit made in either is the same edit, undone by either, and neither can drift from the other.
+/// What is *not* here is what a view owns alone: where its carets are, where it is scrolled to,
+/// how it is themed.
 #[derive(Debug)]
-pub struct EditorState {
+pub struct DocumentState {
     /// The text.
     pub buffer: Buffer,
-    /// The selections. Always at least one, always grapheme-aligned, always disjoint.
-    pub selections: Selections,
-    /// The undo history.
+    /// The undo history, which is the document's rather than any view's: undoing in one window
+    /// undoes the change, not that window's share of it.
     pub history: History,
     /// The options editing follows.
     pub options: EditOptions,
 }
 
-impl EditorState {
-    /// An editor over `text`, with a caret at the start.
+impl DocumentState {
+    /// A document over `text`.
     pub fn new(text: &str) -> Self {
         Self {
             buffer: Buffer::from_str(text),
-            selections: Selections::caret(0),
             history: History::new(),
             options: EditOptions::default(),
         }
     }
 
+    /// A consistent snapshot for a worker: the rope (an O(1) clone) and its revision.
+    pub fn snapshot(&self) -> (Rope, u64) {
+        (self.buffer.rope().clone(), self.buffer.revision())
+    }
+}
+
+/// One view's write access to a document: the text everyone shares, and the carets only this
+/// view moves.
+///
+/// Borrowed rather than owned, and built for the length of one command. Every invariant the model
+/// has — grapheme-aligned selections, disjoint edits, history recording — is enforced through
+/// [`apply`](EditorState::apply), and a command applies to exactly one view's selections however
+/// many views the document has.
+#[derive(Debug)]
+pub struct EditorState<'a> {
+    /// The text, the history and the options.
+    pub doc: &'a mut DocumentState,
+    /// This view's selections. Always at least one, always grapheme-aligned, always disjoint.
+    pub selections: &'a mut Selections,
+}
+
+impl EditorState<'_> {
     /// Replaces the whole text, clearing history and selections, as opening a file does.
     pub fn set_text(&mut self, text: &str) -> Response {
-        self.buffer.set_text(text);
-        self.selections = Selections::caret(0);
-        self.history = History::new();
+        self.doc.buffer.set_text(text);
+        *self.selections = Selections::caret(0);
+        self.doc.history = History::new();
         Response {
             change: Some(ChangeInfo {
                 first_changed_line: 0,
@@ -141,6 +172,7 @@ impl EditorState {
                 // one; a consumer that synchronises incrementally has to resend the document.
                 changes: Arc::from([] as [TextChange; 0]),
                 kind: EditKind::Other,
+                whole_text: true,
             }),
             selection_changed: true,
             scroll: Some(ScrollEffect::Command(ScrollCmd::ToLine(0))),
@@ -156,10 +188,10 @@ impl EditorState {
                 count,
                 extend,
             } => {
-                self.history.seal();
+                self.doc.history.seal();
                 self.selections.map(|selection| {
                     motion::apply(
-                        self.buffer.rope(),
+                        self.doc.buffer.rope(),
                         selection,
                         *motion,
                         *count,
@@ -173,8 +205,8 @@ impl EditorState {
                 selections,
                 primary,
             } => {
-                self.history.seal();
-                let rope = self.buffer.rope().clone();
+                self.doc.history.seal();
+                let rope = self.doc.buffer.rope().clone();
                 let snapped: Vec<Selection> = selections
                     .iter()
                     .map(|selection| Selection {
@@ -190,17 +222,17 @@ impl EditorState {
                 }
             }
             Command::SelectAll => {
-                self.history.seal();
+                self.doc.history.seal();
                 self.selections
-                    .set_one(Selection::new(0, self.buffer.len_bytes()));
+                    .set_one(Selection::new(0, self.doc.buffer.len_bytes()));
                 Response {
                     selection_changed: true,
                     ..Response::default()
                 }
             }
             Command::SelectWord => {
-                self.history.seal();
-                let rope = self.buffer.rope().clone();
+                self.doc.history.seal();
+                let rope = self.doc.buffer.rope().clone();
                 self.selections.map(|selection| {
                     let word = words::word_at(&rope, selection.head);
                     Selection::new(word.start, word.end)
@@ -208,8 +240,8 @@ impl EditorState {
                 Response::selection()
             }
             Command::SelectLines { count } => {
-                self.history.seal();
-                let rope = self.buffer.rope().clone();
+                self.doc.history.seal();
+                let rope = self.doc.buffer.rope().clone();
                 let count = (*count).max(1) as usize;
                 self.selections.map(|selection| {
                     let from = position::line_of(&rope, selection.start());
@@ -238,18 +270,18 @@ impl EditorState {
                 Response::selection()
             }
             Command::CollapseToHead => {
-                self.history.seal();
+                self.doc.history.seal();
                 self.selections.map(|selection| selection.collapsed());
                 Response::selection()
             }
             Command::CollapseToAnchor => {
-                self.history.seal();
+                self.doc.history.seal();
                 self.selections
                     .map(|selection| Selection::caret(selection.anchor));
                 Response::selection()
             }
             Command::SwapHeadAnchor => {
-                self.history.seal();
+                self.doc.history.seal();
                 self.selections.map(|selection| Selection {
                     anchor: selection.head,
                     head: selection.anchor,
@@ -259,8 +291,8 @@ impl EditorState {
             }
             Command::Insert(text) => self.replace_selections(|_, _| text.clone(), EditKind::Typing),
             Command::InsertNewline => {
-                let rope = self.buffer.rope().clone();
-                let auto_indent = self.options.auto_indent;
+                let rope = self.doc.buffer.rope().clone();
+                let auto_indent = self.doc.options.auto_indent;
                 self.replace_selections(
                     move |_, selection: &Selection| {
                         if !auto_indent {
@@ -278,7 +310,7 @@ impl EditorState {
                 )
             }
             Command::Backspace => {
-                let rope = self.buffer.rope().clone();
+                let rope = self.doc.buffer.rope().clone();
                 let ranges = self
                     .selections
                     .iter()
@@ -294,7 +326,7 @@ impl EditorState {
                 self.edit(ranges, EditKind::Deletion, None)
             }
             Command::DeleteForward => {
-                let rope = self.buffer.rope().clone();
+                let rope = self.doc.buffer.rope().clone();
                 let ranges = self
                     .selections
                     .iter()
@@ -322,7 +354,7 @@ impl EditorState {
                 count,
                 linewise,
             } => {
-                let rope = self.buffer.rope().clone();
+                let rope = self.doc.buffer.rope().clone();
                 let ranges: Vec<(Range<usize>, String)> = self
                     .selections
                     .iter()
@@ -342,7 +374,7 @@ impl EditorState {
                 let mut response = self.edit(ranges, EditKind::Other, carets);
                 if *linewise && response.change.is_some() {
                     // The caret lands on the first non-blank of the line that moved up.
-                    let rope = self.buffer.rope().clone();
+                    let rope = self.doc.buffer.rope().clone();
                     self.selections.map(|selection| {
                         let line = position::line_of(&rope, selection.head);
                         Selection::caret(motion::first_non_blank(&rope, line))
@@ -386,7 +418,7 @@ impl EditorState {
 
     /// The selected text, one selection per line break; carets contribute their whole line.
     pub fn selected_text(&self) -> String {
-        let rope = self.buffer.rope();
+        let rope = self.doc.buffer.rope();
         let mut parts: Vec<String> = Vec::new();
         for selection in self.selections.iter() {
             if selection.is_caret() {
@@ -431,7 +463,7 @@ impl EditorState {
         kind: EditKind,
         carets: Option<Vec<usize>>,
     ) -> Response {
-        if self.options.read_only {
+        if self.doc.options.read_only {
             return Response::nothing();
         }
         replacements.sort_by_key(|(range, _)| range.start);
@@ -446,7 +478,7 @@ impl EditorState {
             return Response::nothing();
         }
 
-        let before_rope = self.buffer.rope().clone();
+        let before_rope = self.doc.buffer.rope().clone();
         let before = self.selections.clone();
         let edits: Vec<Edit> = replacements
             .iter()
@@ -459,7 +491,7 @@ impl EditorState {
             .collect();
 
         let mut tx = Transaction::new(edits, before.clone(), before.clone(), kind, Instant::now());
-        self.buffer.apply(&tx.edits);
+        self.doc.buffer.apply(&tx.edits);
 
         // Where the selections land: mapped through the edits, or where the caller said.
         match carets {
@@ -488,7 +520,7 @@ impl EditorState {
             .unwrap_or(0);
         let input_edits = tx.input_edits(&before_rope);
         let changes: Arc<[TextChange]> = Arc::from(tx.changes());
-        self.history.push(tx);
+        self.doc.history.push(tx);
 
         Response {
             change: Some(ChangeInfo {
@@ -496,6 +528,7 @@ impl EditorState {
                 input_edits,
                 changes,
                 kind,
+                whole_text: false,
             }),
             selection_changed: true,
             scroll: Some(ScrollEffect::EnsureVisible),
@@ -505,8 +538,8 @@ impl EditorState {
 
     /// Indents or dedents every line a selection touches.
     fn indent(&mut self, dedent: bool) -> Response {
-        let rope = self.buffer.rope().clone();
-        let indent = self.options.indent.clone();
+        let rope = self.doc.buffer.rope().clone();
+        let indent = self.doc.options.indent.clone();
         let mut lines: Vec<usize> = Vec::new();
         for selection in self.selections.iter() {
             let from = position::line_of(&rope, selection.start());
@@ -559,7 +592,7 @@ impl EditorState {
 
     /// Inserts supplied text — a paste, a register — where `at` and `linewise` say.
     fn insert_at(&mut self, at: InsertPoint, text: &str, linewise: bool) -> Response {
-        let rope = self.buffer.rope().clone();
+        let rope = self.doc.buffer.rope().clone();
         if linewise {
             // The text takes whole lines of its own, above (P) or below (p) each caret's line.
             let mut block = text.to_string();
@@ -596,7 +629,7 @@ impl EditorState {
             let response = self.edit(replacements, EditKind::Paste, Some(carets));
             if response.change.is_some() {
                 // The caret belongs on the first non-blank of the first pasted line.
-                let rope = self.buffer.rope().clone();
+                let rope = self.doc.buffer.rope().clone();
                 self.selections.map(|selection| {
                     let line = position::line_of(&rope, selection.head);
                     Selection::caret(motion::first_non_blank(&rope, line))
@@ -630,7 +663,7 @@ impl EditorState {
 
     /// Undoes one step.
     fn undo(&mut self) -> Response {
-        let Some(step) = self.history.undo() else {
+        let Some(step) = self.doc.history.undo() else {
             return Response::nothing();
         };
         let mut input_edits = Vec::new();
@@ -638,16 +671,16 @@ impl EditorState {
         let mut first_changed_line = usize::MAX;
         for tx in step.transactions.iter().rev() {
             let inverted = tx.invert();
-            let before_rope = self.buffer.rope().clone();
+            let before_rope = self.doc.buffer.rope().clone();
             input_edits.extend(inverted.input_edits(&before_rope));
             changes.extend(inverted.changes());
             if let Some(edit) = inverted.edits.last() {
                 first_changed_line =
                     first_changed_line.min(position::line_of(&before_rope, edit.range.start));
             }
-            self.buffer.apply(&inverted.edits);
+            self.doc.buffer.apply(&inverted.edits);
         }
-        self.selections = step
+        *self.selections = step
             .transactions
             .first()
             .map(|tx| tx.before.clone())
@@ -662,6 +695,7 @@ impl EditorState {
                 input_edits,
                 changes: Arc::from(changes),
                 kind: EditKind::Other,
+                whole_text: false,
             }),
             selection_changed: true,
             scroll: Some(ScrollEffect::EnsureVisible),
@@ -671,23 +705,23 @@ impl EditorState {
 
     /// Redoes one undone step.
     fn redo(&mut self) -> Response {
-        let Some(step) = self.history.redo() else {
+        let Some(step) = self.doc.history.redo() else {
             return Response::nothing();
         };
         let mut input_edits = Vec::new();
         let mut changes: Vec<TextChange> = Vec::new();
         let mut first_changed_line = usize::MAX;
         for tx in &step.transactions {
-            let before_rope = self.buffer.rope().clone();
+            let before_rope = self.doc.buffer.rope().clone();
             input_edits.extend(tx.input_edits(&before_rope));
             changes.extend(tx.changes());
             if let Some(edit) = tx.edits.last() {
                 first_changed_line =
                     first_changed_line.min(position::line_of(&before_rope, edit.range.start));
             }
-            self.buffer.apply(&tx.edits);
+            self.doc.buffer.apply(&tx.edits);
         }
-        self.selections = step
+        *self.selections = step
             .transactions
             .last()
             .map(|tx| tx.after.clone())
@@ -702,16 +736,12 @@ impl EditorState {
                 input_edits,
                 changes: Arc::from(changes),
                 kind: EditKind::Other,
+                whole_text: false,
             }),
             selection_changed: true,
             scroll: Some(ScrollEffect::EnsureVisible),
             ..Response::default()
         }
-    }
-
-    /// A consistent snapshot for a worker: the rope (an O(1) clone) and its revision.
-    pub fn snapshot(&self) -> (Rope, u64) {
-        (self.buffer.rope().clone(), self.buffer.revision())
     }
 }
 
@@ -722,12 +752,38 @@ mod tests {
 
     const NO_VIEW: MotionContext = MotionContext { viewport_lines: 10 };
 
-    fn editor(text: &str) -> EditorState {
-        EditorState::new(text)
+    /// A document and the one view of it these tests act through.
+    ///
+    /// The two are separate values in the model, because several views share one document. A test
+    /// holds both and pairs them for the length of a command, which is exactly what the component
+    /// does.
+    struct Editor {
+        doc: DocumentState,
+        selections: Selections,
     }
 
-    fn apply(editor: &mut EditorState, command: Command) -> Response {
-        editor.apply(&command, NO_VIEW)
+    impl Editor {
+        fn state(&mut self) -> EditorState<'_> {
+            EditorState {
+                doc: &mut self.doc,
+                selections: &mut self.selections,
+            }
+        }
+
+        fn text(&self) -> String {
+            self.doc.buffer.rope().to_string()
+        }
+    }
+
+    fn editor(text: &str) -> Editor {
+        Editor {
+            doc: DocumentState::new(text),
+            selections: Selections::caret(0),
+        }
+    }
+
+    fn apply(editor: &mut Editor, command: Command) -> Response {
+        editor.state().apply(&command, NO_VIEW)
     }
 
     #[test]
@@ -748,7 +804,7 @@ mod tests {
         assert_eq!(change.changes.len(), 1);
         assert_eq!(change.changes[0].range, 6..6);
         assert_eq!(change.changes[0].text, "brave ");
-        assert_eq!(editor.buffer.rope().to_string(), "hello brave world");
+        assert_eq!(editor.text(), "hello brave world");
     }
 
     #[test]
@@ -778,7 +834,7 @@ mod tests {
         // Addressed in the changed text: the X that was inserted is what comes back out.
         assert_eq!(change.changes[0].range, 0..1);
         assert_eq!(change.changes[0].text, "");
-        assert_eq!(editor.buffer.rope().to_string(), "abc");
+        assert_eq!(editor.text(), "abc");
     }
 
     #[test]
@@ -796,14 +852,14 @@ mod tests {
         let change = response.change.expect("the text changed");
         let starts: Vec<usize> = change.changes.iter().map(|c| c.range.start).collect();
         assert_eq!(starts, [2, 0]);
-        assert_eq!(editor.buffer.rope().to_string(), ">a\n>b\n");
+        assert_eq!(editor.text(), ">a\n>b\n");
     }
 
     #[test]
     fn typing_inserts_at_the_caret() {
         let mut editor = editor("world");
         apply(&mut editor, Command::Insert("hello ".to_string()));
-        assert_eq!(editor.buffer.to_string(), "hello world");
+        assert_eq!(editor.doc.buffer.to_string(), "hello world");
         assert_eq!(editor.selections.primary().head, 6);
     }
 
@@ -818,7 +874,7 @@ mod tests {
             },
         );
         apply(&mut editor, Command::Insert("goodbye".to_string()));
-        assert_eq!(editor.buffer.to_string(), "goodbye world");
+        assert_eq!(editor.doc.buffer.to_string(), "goodbye world");
         assert_eq!(editor.selections.primary().head, 7);
         assert!(editor.selections.primary().is_caret());
     }
@@ -838,7 +894,7 @@ mod tests {
             },
         );
         apply(&mut editor, Command::Insert("x".to_string()));
-        assert_eq!(editor.buffer.to_string(), "xa\nxb\nxc");
+        assert_eq!(editor.doc.buffer.to_string(), "xa\nxb\nxc");
         let heads: Vec<usize> = editor.selections.iter().map(|s| s.head).collect();
         assert_eq!(heads, vec![1, 4, 7]);
     }
@@ -855,7 +911,7 @@ mod tests {
             },
         );
         apply(&mut editor, Command::Backspace);
-        assert_eq!(editor.buffer.to_string(), "a");
+        assert_eq!(editor.doc.buffer.to_string(), "a");
         apply(
             &mut editor,
             Command::SetSelections {
@@ -864,7 +920,7 @@ mod tests {
             },
         );
         apply(&mut editor, Command::Backspace);
-        assert_eq!(editor.buffer.to_string(), "");
+        assert_eq!(editor.doc.buffer.to_string(), "");
     }
 
     #[test]
@@ -879,19 +935,19 @@ mod tests {
             },
         );
         apply(&mut editor, Command::InsertNewline);
-        assert_eq!(editor.buffer.to_string(), "    code\n    ");
+        assert_eq!(editor.doc.buffer.to_string(), "    code\n    ");
     }
 
     #[test]
     fn undo_restores_text_and_selection() {
         let mut editor = editor("one");
         apply(&mut editor, Command::Insert("x".to_string()));
-        assert_eq!(editor.buffer.to_string(), "xone");
+        assert_eq!(editor.doc.buffer.to_string(), "xone");
         apply(&mut editor, Command::Undo);
-        assert_eq!(editor.buffer.to_string(), "one");
+        assert_eq!(editor.doc.buffer.to_string(), "one");
         assert_eq!(editor.selections.primary().head, 0);
         apply(&mut editor, Command::Redo);
-        assert_eq!(editor.buffer.to_string(), "xone");
+        assert_eq!(editor.doc.buffer.to_string(), "xone");
         assert_eq!(editor.selections.primary().head, 1);
     }
 
@@ -901,9 +957,9 @@ mod tests {
         apply(&mut editor, Command::Insert("a".to_string()));
         apply(&mut editor, Command::Insert("b".to_string()));
         apply(&mut editor, Command::Insert("c".to_string()));
-        assert_eq!(editor.buffer.to_string(), "abc");
+        assert_eq!(editor.doc.buffer.to_string(), "abc");
         apply(&mut editor, Command::Undo);
-        assert_eq!(editor.buffer.to_string(), "");
+        assert_eq!(editor.doc.buffer.to_string(), "");
     }
 
     #[test]
@@ -921,7 +977,7 @@ mod tests {
         apply(&mut editor, Command::Insert("b".to_string()));
         apply(&mut editor, Command::Undo);
         assert_eq!(
-            editor.buffer.to_string(),
+            editor.doc.buffer.to_string(),
             "a",
             "only the second burst undoes"
         );
@@ -945,7 +1001,7 @@ mod tests {
                 linewise: true,
             },
         );
-        assert_eq!(editor.buffer.to_string(), "one\nthree");
+        assert_eq!(editor.doc.buffer.to_string(), "one\nthree");
         assert_eq!(editor.selections.primary().head, 4);
     }
 
@@ -960,7 +1016,7 @@ mod tests {
                 linewise: true,
             },
         );
-        assert_eq!(editor.buffer.to_string(), "one\nnew\ntwo");
+        assert_eq!(editor.doc.buffer.to_string(), "one\nnew\ntwo");
         assert_eq!(editor.selections.primary().head, 4);
     }
 
@@ -975,7 +1031,7 @@ mod tests {
                 linewise: true,
             },
         );
-        assert_eq!(editor.buffer.to_string(), "one\nnew");
+        assert_eq!(editor.doc.buffer.to_string(), "one\nnew");
     }
 
     #[test]
@@ -989,18 +1045,18 @@ mod tests {
             },
         );
         apply(&mut editor, Command::IndentLines { dedent: false });
-        assert_eq!(editor.buffer.to_string(), "    one\n    two");
+        assert_eq!(editor.doc.buffer.to_string(), "    one\n    two");
         apply(&mut editor, Command::IndentLines { dedent: true });
-        assert_eq!(editor.buffer.to_string(), "one\ntwo");
+        assert_eq!(editor.doc.buffer.to_string(), "one\ntwo");
     }
 
     #[test]
     fn read_only_refuses_edits() {
         let mut editor = editor("text");
-        editor.options.read_only = true;
+        editor.doc.options.read_only = true;
         let response = apply(&mut editor, Command::Insert("x".to_string()));
         assert!(response.change.is_none());
-        assert_eq!(editor.buffer.to_string(), "text");
+        assert_eq!(editor.doc.buffer.to_string(), "text");
     }
 
     #[test]
@@ -1018,7 +1074,7 @@ mod tests {
             response.copied,
             Some((Clipboard::Standard, "hello".to_string()))
         );
-        assert_eq!(editor.buffer.to_string(), " world");
+        assert_eq!(editor.doc.buffer.to_string(), " world");
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! is what makes a vim layer or a completion engine implementable outside the crate — or
 //! reactively through signals, which is what a status line binds to.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -19,8 +19,9 @@ use crate::config::{CursorStyle, GutterMode};
 use crate::core::motion::{self, MotionContext};
 use crate::core::search::SearchDirection;
 use crate::core::selection::{Selection, Selections};
-use crate::core::{EditorState, Response, ScrollEffect, position, search, words};
+use crate::core::{ChangeInfo, EditorState, Response, ScrollEffect, position, search, words};
 use crate::decoration::{Decoration, GutterMark};
+use crate::document::{Document, ViewId};
 use crate::event::EditorEvent;
 use crate::render::element::EditorElement;
 use crate::render::shared::EditorShared;
@@ -60,8 +61,13 @@ pub struct CaretRect {
 }
 
 /// What a [`EditorHandle::query`] closure is handed: read access to the model.
+///
+/// The document is what every view of the buffer shares; the selections are the queried view's
+/// alone. A vim layer asking where its caret is asks *this* view, and gets its own answer even
+/// when a second window is open on the same file.
 pub struct EditorSnapshot<'a> {
-    state: &'a EditorState,
+    doc: &'a crate::core::DocumentState,
+    selections: &'a Selections,
     context: MotionContext,
     visible: Range<usize>,
 }
@@ -80,7 +86,7 @@ impl EditorSnapshot<'_> {
     /// Empty while the editor has not been laid out yet, which is also when there is nothing to
     /// see. Half-open, and clamped to the text — the caller can slice the rope with it directly.
     pub fn visible_byte_range(&self) -> Range<usize> {
-        let rope = self.state.buffer.rope();
+        let rope = self.doc.buffer.rope();
         if self.visible.is_empty() {
             return 0..0;
         }
@@ -96,38 +102,38 @@ impl EditorSnapshot<'_> {
 
     /// The text. Cloning the rope is O(1).
     pub fn rope(&self) -> &ropey::Rope {
-        self.state.buffer.rope()
+        self.doc.buffer.rope()
     }
 
     /// Which revision of the text this is.
     pub fn revision(&self) -> u64 {
-        self.state.buffer.revision()
+        self.doc.buffer.revision()
     }
 
-    /// The selections, in document order.
+    /// This view's selections, in document order.
     pub fn selections(&self) -> &Selections {
-        &self.state.selections
+        self.selections
     }
 
     /// How many lines the text has.
     pub fn line_count(&self) -> usize {
-        position::line_count(self.state.buffer.rope())
+        position::line_count(self.doc.buffer.rope())
     }
 
     /// The text in `range`, copied out.
     pub fn text_in(&self, range: Range<usize>) -> String {
-        self.state.buffer.rope().byte_slice(range).to_string()
+        self.doc.buffer.rope().byte_slice(range).to_string()
     }
 
     /// The line and grapheme column of `byte`.
     pub fn line_col(&self, byte: usize) -> CursorPos {
-        let (line, col) = position::line_col(self.state.buffer.rope(), byte);
+        let (line, col) = position::line_col(self.doc.buffer.rope(), byte);
         CursorPos { line, col }
     }
 
     /// The word under `byte`, as a double click selects it.
     pub fn word_at(&self, byte: usize) -> Range<usize> {
-        words::word_at(self.state.buffer.rope(), byte)
+        words::word_at(self.doc.buffer.rope(), byte)
     }
 
     /// The bytes `motion` would span from `selection` — what an operator like `d` or `y` takes,
@@ -140,7 +146,7 @@ impl EditorSnapshot<'_> {
         linewise: bool,
     ) -> Range<usize> {
         motion::motion_range(
-            self.state.buffer.rope(),
+            self.doc.buffer.rope(),
             selection,
             motion,
             count,
@@ -157,7 +163,7 @@ impl EditorSnapshot<'_> {
         direction: SearchDirection,
         wrap: bool,
     ) -> Option<Range<usize>> {
-        search::find(self.state.buffer.rope(), needle, from, direction, wrap)
+        search::find(self.doc.buffer.rope(), needle, from, direction, wrap)
     }
 }
 
@@ -188,6 +194,11 @@ type EventReporter = Option<Box<dyn Fn(EditorEvent)>>;
 /// Everything a dispatch needs beyond the model itself. Owned by the component, shared with
 /// every handle clone.
 pub(crate) struct EditorCtx {
+    /// The text, shared with every other view of the same buffer.
+    pub document: Document,
+    /// Which view of that document this is, so a change can be told to the others and not to
+    /// itself.
+    pub view_id: Cell<ViewId>,
     pub shared: Rc<RefCell<EditorShared>>,
     pub element: zgui::custom::CustomHandle<EditorElement>,
     pub port: NodeRef,
@@ -208,6 +219,7 @@ pub struct EditorHandle {
 
 impl EditorHandle {
     pub(crate) fn new(
+        document: Document,
         shared: Rc<RefCell<EditorShared>>,
         element: zgui::custom::CustomHandle<EditorElement>,
         port: NodeRef,
@@ -217,6 +229,8 @@ impl EditorHandle {
     ) -> Self {
         Self {
             ctx: Rc::new(EditorCtx {
+                document,
+                view_id: Cell::new(ViewId::UNATTACHED),
                 shared,
                 element,
                 port,
@@ -244,8 +258,10 @@ impl EditorHandle {
     /// Reads the model synchronously.
     pub fn query<R>(&self, read: impl FnOnce(&EditorSnapshot<'_>) -> R) -> R {
         let shared = self.ctx.shared.borrow();
+        let doc = self.ctx.document.state();
         let snapshot = EditorSnapshot {
-            state: &shared.state,
+            doc: &doc,
+            selections: &shared.selections,
             context: shared.motion_context(),
             visible: shared.visible_lines(),
         };
@@ -260,7 +276,12 @@ impl EditorHandle {
             shared.syntax.clear();
             shared.max_line_width = 0.0;
             shared.max_line_chars = None;
-            shared.state.set_text(text)
+            let mut doc = self.ctx.document.state_mut();
+            EditorState {
+                doc: &mut doc,
+                selections: &mut shared.selections,
+            }
+            .set_text(text)
         };
         self.settle(response);
         self.scan_max_width();
@@ -276,7 +297,7 @@ impl EditorHandle {
         shared.syntax.set_captures(Vec::new(), &theme);
         shared.lines.clear();
         if let Some(tx) = shared.syntax_tx.as_ref() {
-            let (rope, revision) = shared.state.snapshot();
+            let (rope, revision) = shared.document.state().snapshot();
             let _ = tx.send(crate::syntax::worker::ToWorker::SetLanguage(
                 config, rope, revision,
             ));
@@ -302,7 +323,7 @@ impl EditorHandle {
                 shared.syntax.set_captures(names, &theme);
             }
             crate::syntax::worker::FromWorker::Frame(frame) => {
-                if frame.revision != shared.state.buffer.revision() {
+                if frame.revision != shared.revision() {
                     // The frame describes text that no longer exists; the worker converges on
                     // the newest text on its own.
                     return;
@@ -462,7 +483,7 @@ impl EditorHandle {
     pub(crate) fn scan_max_width(&self) {
         let (rope, revision) = {
             let shared = self.ctx.shared.borrow();
-            shared.state.snapshot()
+            shared.document.state().snapshot()
         };
         let work = zgui::task::blocking(move || {
             rope.lines().map(|line| line.len_chars()).max().unwrap_or(0)
@@ -471,7 +492,7 @@ impl EditorHandle {
         let task = zgui::task::spawn_local(async move {
             let chars = work.await;
             let mut shared = handle.ctx.shared.borrow_mut();
-            if shared.state.buffer.revision() != revision {
+            if shared.revision() != revision {
                 return;
             }
             let extent_before = shared.horizontal_extent();
@@ -486,11 +507,65 @@ impl EditorHandle {
 
     // ---- Internals ---------------------------------------------------------------------
 
+    /// Registers this view with its document.
+    pub(crate) fn attach_to_document(&self) {
+        let id = self.ctx.document.attach(&self.ctx);
+        self.ctx.view_id.set(id);
+    }
+
+    /// Takes it off again, which the component does from its own cleanup.
+    pub(crate) fn detach_from_document(&self) {
+        self.ctx.document.detach(self.ctx.view_id.get());
+    }
+
+    /// The handle for a context somebody else is holding.
+    pub(crate) fn from_ctx(ctx: Rc<EditorCtx>) -> Self {
+        Self { ctx }
+    }
+
+    /// Takes a change another view of the same document made.
+    ///
+    /// This view's carets move through the replacements, its caches drop what the change touched,
+    /// and its highlighter is told. Nothing is reported to the application: a second window onto
+    /// a file is a second view of one change, not a second change.
+    pub(crate) fn follow(&self, change: &ChangeInfo) {
+        {
+            let mut shared = self.ctx.shared.borrow_mut();
+            if change.whole_text {
+                // A replaced text has no positions to carry forward.
+                shared.selections = Selections::caret(0);
+            } else {
+                let rope = shared.rope();
+                let changes = Arc::clone(&change.changes);
+                shared.selections.map(|selection| Selection {
+                    anchor: position::snap(
+                        &rope,
+                        crate::core::edit::map_through(&changes, selection.anchor),
+                    ),
+                    head: position::snap(
+                        &rope,
+                        crate::core::edit::map_through(&changes, selection.head),
+                    ),
+                    affinity: selection.affinity,
+                    goal_col: None,
+                });
+            }
+            shared.absorb_change(change);
+            self.update_signals(&mut shared);
+        }
+        self.ctx.element.relayout();
+    }
+
     fn dispatch(&self, command: &Command) {
         let response = {
             let mut shared = self.ctx.shared.borrow_mut();
             let context = shared.motion_context();
-            shared.state.apply(command, context)
+            let mut doc = self.ctx.document.state_mut();
+            EditorState {
+                doc: &mut doc,
+                selections: &mut shared.selections,
+            }
+            .apply(command, context)
         };
         self.settle(response);
     }
@@ -503,42 +578,7 @@ impl EditorHandle {
             let gutter_before = shared.gutter_width();
 
             if let Some(change) = response.change.as_ref() {
-                // How many lines the change added or removed, and the last line it touched —
-                // readable straight off the tree-sitter deltas it already carries.
-                let line_delta: isize = change
-                    .input_edits
-                    .iter()
-                    .map(|edit| {
-                        edit.new_end_position.row as isize - edit.old_end_position.row as isize
-                    })
-                    .sum();
-                let last_changed_line = change
-                    .input_edits
-                    .iter()
-                    .map(|edit| edit.old_end_position.row.max(edit.new_end_position.row))
-                    .max()
-                    .unwrap_or(change.first_changed_line);
-                if line_delta == 0 {
-                    // Nothing below the edit moved: only the touched lines rebuild, and the
-                    // highlight spans stay put — slightly stale for a frame or two, which
-                    // reads as nothing, where dropping them reads as a white flash.
-                    shared
-                        .lines
-                        .invalidate_range(change.first_changed_line, last_changed_line);
-                } else {
-                    shared.lines.invalidate_from(change.first_changed_line);
-                    shared
-                        .syntax
-                        .shift_lines(change.first_changed_line, line_delta);
-                }
-                if let Some(tx) = shared.syntax_tx.as_ref() {
-                    let (snapshot, revision) = shared.state.snapshot();
-                    let _ = tx.send(crate::syntax::worker::ToWorker::Edited {
-                        input_edits: change.input_edits.clone(),
-                        snapshot,
-                        revision,
-                    });
-                }
+                shared.absorb_change(change);
             }
 
             if response.change.is_some() || response.selection_changed {
@@ -597,13 +637,19 @@ impl EditorHandle {
             });
         }
 
+        // The other views of this document, which have to follow the change before the frame
+        // this settle is part of is drawn.
+        if let Some(change) = response.change.as_ref() {
+            self.ctx.document.broadcast(change, self.ctx.view_id.get());
+        }
+
         // The reports.
         let report = self.ctx.on_event.borrow();
         if let Some(tell) = report.as_ref() {
             if let Some(change) = response.change.as_ref() {
                 tell(EditorEvent::Edited {
                     kind: change.kind,
-                    revision: self.ctx.shared.borrow().state.buffer.revision(),
+                    revision: self.ctx.shared.borrow().revision(),
                     changes: Arc::clone(&change.changes),
                 });
             } else if response.selection_changed {
@@ -623,9 +669,9 @@ impl EditorHandle {
 
     /// Brings the primary caret into view: instantly for a nudge, gliding for a jump.
     fn ensure_caret_visible(&self, shared: &mut EditorShared) {
-        let head = shared.state.selections.primary().head;
+        let head = shared.selections.primary().head;
         let (line, x) = shared.caret_position(head);
-        let total = position::line_count(shared.state.buffer.rope());
+        let total = shared.line_count();
         let viewport = shared.viewport_lines();
         let scrolloff = shared.config.scrolloff;
 
@@ -662,12 +708,9 @@ impl EditorHandle {
 
     /// Applies an explicit scroll command.
     fn apply_scroll(&self, shared: &mut EditorShared, command: ScrollCmd) {
-        let total = position::line_count(shared.state.buffer.rope());
+        let total = shared.line_count();
         let viewport = shared.viewport_lines();
-        let caret_line = position::line_of(
-            shared.state.buffer.rope(),
-            shared.state.selections.primary().head,
-        ) as f64;
+        let caret_line = position::line_of(&shared.rope(), shared.selections.primary().head) as f64;
         match command {
             ScrollCmd::Lines(lines) => shared.scroll.scroll_by(lines, total, viewport),
             ScrollCmd::Pages(pages) => shared.scroll.scroll_by(pages * viewport, total, viewport),
@@ -699,13 +742,10 @@ impl EditorHandle {
 
     /// Publishes the reactive reads.
     pub(crate) fn update_signals(&self, shared: &mut EditorShared) {
-        let primary = shared.state.selections.primary();
-        let rope = shared.state.buffer.rope().clone();
+        let primary = shared.selections.primary();
+        let rope = shared.rope();
         let (line, col) = position::line_col(&rope, primary.head);
-        self.ctx
-            .signals
-            .revision
-            .set(shared.state.buffer.revision());
+        self.ctx.signals.revision.set(shared.revision());
         self.ctx.signals.cursor.set(CursorPos { line, col });
         self.ctx.signals.selection.set(primary);
         let total = position::line_count(&rope);
@@ -735,7 +775,7 @@ impl EditorHandle {
 
     /// Where the primary caret sits on the window right now, when it is visible.
     fn caret_rect_now(&self, shared: &mut EditorShared) -> Option<CaretRect> {
-        let head = shared.state.selections.primary().head;
+        let head = shared.selections.primary().head;
         self.point_in(shared, head)
     }
 

@@ -1,27 +1,31 @@
 //! The one place the view's handlers and the element's frames meet.
 //!
-//! Everything the editor is — the model, the scroll position, the metrics, the theme, the
-//! caches — lives here behind one `Rc<RefCell<_>>`. Event handlers mutate it and say so through
-//! the element handle; `layout` reads the style into it; `paint` reads it out as primitives.
-//! Nothing else holds state, so nothing else can disagree.
+//! Everything one view of a buffer is — its carets, its scroll position, its metrics, its theme,
+//! its caches — lives here behind one `Rc<RefCell<_>>`. Event handlers mutate it and say so
+//! through the element handle; `layout` reads the style into it; `paint` reads it out as
+//! primitives. Nothing else holds view state, so nothing else can disagree.
+//!
+//! The text is not here. It is behind a second handle, because several views can share one
+//! document — which is what makes two windows onto the same file two of these and one of that.
 
 use std::ops::Range;
 use std::rc::Rc;
 
 use compact_str::CompactString;
-use zgui::elements::kurbo;
-
 use zgui::app::Shaper;
 use zgui::canvas::zgui_color::Color;
 use zgui::custom::{PaintSlot, ScenePainter, ShapedRun};
+use zgui::elements::kurbo;
 use zgui::geom::{Device, DevicePx, Point, Rect, Size};
 use zgui_css::ComputedStyle;
 use zgui_interned::Ident;
 
 use crate::config::{CursorStyle, EditorConfig, GutterMode};
 use crate::core::motion::MotionContext;
-use crate::core::{EditorState, position};
+use crate::core::position;
+use crate::core::selection::Selections;
 use crate::decoration::{Decoration, DecorationKind, GutterMark, Layers, Paint, UnderlineStyle};
+use crate::document::Document;
 use crate::render::line_cache::{self, CachedLine, LineCache};
 use crate::render::metrics::TextMetrics;
 use crate::render::shaping::ShapingCache;
@@ -44,10 +48,16 @@ pub struct StyleReport {
     pub viewport: (f32, f32),
 }
 
-/// The editor, as one mutable value.
+/// One view of one document, as one mutable value.
+///
+/// The document is behind a second handle because it is shared: two windows onto the same file
+/// hold one document and two of these. Everything else here belongs to this view alone — its
+/// carets, where it is scrolled to, what it measured, what it has shaped and painted.
 pub struct EditorShared {
-    /// The model.
-    pub state: EditorState,
+    /// The text, the history and the options, shared with every other view of this document.
+    pub document: Document,
+    /// This view's selections.
+    pub selections: Selections,
     /// The behaviour.
     pub config: EditorConfig,
     /// Where the view sits.
@@ -99,14 +109,12 @@ pub struct EditorShared {
 }
 
 impl EditorShared {
-    /// A fresh editor over `text`.
-    pub fn new(text: &str, config: EditorConfig, shaper: Option<Shaper>) -> Self {
+    /// A view of `document`.
+    pub fn new(document: Document, config: EditorConfig, shaper: Option<Shaper>) -> Self {
+        document.state_mut().options = config.edit.clone();
         Self {
-            state: {
-                let mut state = EditorState::new(text);
-                state.options = config.edit.clone();
-                state
-            },
+            document,
+            selections: Selections::caret(0),
             config,
             scroll: ScrollState::default(),
             metrics: TextMetrics::default(),
@@ -129,6 +137,72 @@ impl EditorShared {
             max_line_chars: None,
             on_style: None,
             reported: None,
+        }
+    }
+
+    // ---- The document ------------------------------------------------------------------
+
+    /// The text. Cloning a rope is a refcount, so this is what everything here reads through.
+    pub fn rope(&self) -> ropey::Rope {
+        self.document.rope()
+    }
+
+    /// Which revision of the text this is.
+    pub fn revision(&self) -> u64 {
+        self.document.revision()
+    }
+
+    /// How many lines the text has.
+    pub fn line_count(&self) -> usize {
+        self.document.line_count()
+    }
+
+    /// Drops what this view had shaped, painted and highlighted for the lines a change touched,
+    /// and tells its own highlighter about it.
+    ///
+    /// Every view of a document does this for every change, whichever view made it — which is
+    /// what makes the second window onto a file show the first window's typing.
+    pub fn absorb_change(&mut self, change: &crate::core::ChangeInfo) {
+        if change.whole_text {
+            // Nothing about the old text survives, so nothing cached about it can.
+            self.lines.clear();
+            self.syntax.clear();
+            self.max_line_width = 0.0;
+            self.max_line_chars = None;
+        } else {
+            // How many lines the change added or removed, and the last line it touched —
+            // readable straight off the tree-sitter deltas it already carries.
+            let line_delta: isize = change
+                .input_edits
+                .iter()
+                .map(|edit| edit.new_end_position.row as isize - edit.old_end_position.row as isize)
+                .sum();
+            let last_changed_line = change
+                .input_edits
+                .iter()
+                .map(|edit| edit.old_end_position.row.max(edit.new_end_position.row))
+                .max()
+                .unwrap_or(change.first_changed_line);
+            if line_delta == 0 {
+                // Nothing below the edit moved: only the touched lines rebuild, and the highlight
+                // spans stay put — slightly stale for a frame or two, which reads as nothing,
+                // where dropping them reads as a white flash.
+                self.lines
+                    .invalidate_range(change.first_changed_line, last_changed_line);
+            } else {
+                self.lines.invalidate_from(change.first_changed_line);
+                self.syntax
+                    .shift_lines(change.first_changed_line, line_delta);
+            }
+        }
+
+        if let Some(tx) = self.syntax_tx.as_ref() {
+            let (snapshot, revision) = self.document.state().snapshot();
+            let _ = tx.send(crate::syntax::worker::ToWorker::Edited {
+                input_edits: change.input_edits.clone(),
+                snapshot,
+                revision,
+            });
         }
     }
 
@@ -155,7 +229,7 @@ impl EditorShared {
     pub fn scrollbar(&self) -> Scrollbar {
         Scrollbar {
             track: f64::from(self.viewport.1),
-            total: position::line_count(self.state.buffer.rope()),
+            total: self.line_count(),
             viewport: self.viewport_lines(),
         }
     }
@@ -207,7 +281,7 @@ impl EditorShared {
     pub fn gutter_width(&self) -> f32 {
         gutter::width(
             self.config.gutter,
-            position::line_count(self.state.buffer.rope()),
+            self.line_count(),
             self.metrics.cell_advance,
         )
     }
@@ -219,7 +293,7 @@ impl EditorShared {
 
     /// The lines any part of which is on screen.
     pub fn visible_lines(&self) -> Range<usize> {
-        let total = position::line_count(self.state.buffer.rope());
+        let total = self.line_count();
         let first = self.scroll.pos.line.floor().max(0.0) as usize;
         let rows =
             (f64::from(self.viewport.1) / f64::from(self.metrics.line_height)).ceil() as usize + 1;
@@ -411,7 +485,7 @@ impl EditorShared {
     /// The one piece of geometry both selections and decorations need: which part of a byte range
     /// falls on one line, in the coordinates that line's glyphs were placed in.
     fn extent_on_line(&mut self, range: &Range<usize>, line: usize) -> Option<(f32, f32)> {
-        let rope = self.state.buffer.rope().clone();
+        let rope = self.rope();
         let line_start = position::line_start(&rope, line);
         let line_end = position::line_end(&rope, line);
         if range.start > line_end || range.end < line_start {
@@ -438,7 +512,7 @@ impl EditorShared {
 
     /// The painted form of `line`, rebuilt if any of its stamps went stale.
     pub fn ensure_line(&mut self, line: usize) -> Option<CachedLine> {
-        let revision = self.state.buffer.revision();
+        let revision = self.revision();
         let generation = self.metrics.generation;
         let hl_version = self.syntax.version();
         let theme_version = self.theme_version;
@@ -466,8 +540,11 @@ impl EditorShared {
             return Some(rebuilt);
         }
 
+        // Read before the shaper is taken: the text comes from the document, and holding both
+        // borrows at once is what the borrow checker is here to stop.
+        let rope = self.rope();
+        let text = position::line_text(&rope, line);
         let shaper = self.shaper.as_mut()?;
-        let text = position::line_text(self.state.buffer.rope(), line);
         let shaped = self
             .shaping
             .shape(shaper, &self.families, &text, &self.metrics);
@@ -489,7 +566,7 @@ impl EditorShared {
     /// Where the caret at `byte` sits: its line, and its x within the text area before
     /// horizontal scrolling.
     pub fn caret_position(&mut self, byte: usize) -> (usize, f32) {
-        let rope = self.state.buffer.rope().clone();
+        let rope = self.rope();
         let line = position::line_of(&rope, byte);
         let local = (byte - position::line_start(&rope, line)) as u32;
         let x = self
@@ -501,7 +578,7 @@ impl EditorShared {
 
     /// The byte a pointer at `(x, y)` element-local device pixels lands on.
     pub fn hit_test(&mut self, x: f32, y: f32) -> usize {
-        let rope = self.state.buffer.rope().clone();
+        let rope = self.rope();
         let total = position::line_count(&rope);
         let line_f = self.scroll.pos.line + f64::from(y) / f64::from(self.metrics.line_height);
         let line = (line_f.max(0.0) as usize).min(total.saturating_sub(1));
@@ -537,9 +614,8 @@ impl EditorShared {
         let gutter_w = self.gutter_width();
         let text_x0 = gutter_w - self.scroll.pos.x_px as f32;
         let visible = self.visible_lines();
-        let rope = self.state.buffer.rope().clone();
+        let rope = self.rope();
         let caret_lines: Vec<usize> = self
-            .state
             .selections
             .iter()
             .map(|selection| position::line_of(&rope, selection.head))
@@ -580,7 +656,7 @@ impl EditorShared {
             self.theme.selection_inactive
         };
         let selections: Vec<crate::core::selection::Selection> =
-            self.state.selections.iter().copied().collect();
+            self.selections.iter().copied().collect();
         for selection in &selections {
             if selection.is_caret() {
                 continue;
@@ -735,7 +811,7 @@ impl EditorShared {
         if self.decorations.is_empty() {
             return;
         }
-        let rope = self.state.buffer.rope().clone();
+        let rope = self.rope();
         let line_height = self.metrics.line_height;
         // Collected rather than iterated in place: drawing needs the shaped line, and shaping is
         // a mutation of the same value the layers live in.
@@ -779,7 +855,7 @@ impl EditorShared {
         if self.decorations.is_empty() {
             return;
         }
-        let rope = self.state.buffer.rope().clone();
+        let rope = self.rope();
         let scale = self.metrics.scale.max(0.5);
         let line_height = self.metrics.line_height;
         let underlines: Vec<(Range<usize>, UnderlineStyle, Color)> = self
@@ -865,7 +941,7 @@ impl EditorShared {
             return;
         }
         let selections: Vec<crate::core::selection::Selection> =
-            self.state.selections.iter().copied().collect();
+            self.selections.iter().copied().collect();
         for selection in &selections {
             let head = selection.head;
             let line = position::line_of(rope, head);

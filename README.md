@@ -29,6 +29,14 @@ view! {
   and the synchronous `EditorHandle::query` API.
 - **Editing model.** Multi-cursor-capable selections, grapheme-aware movement, vim-style undo
   coalescing, word motions, plain-text search.
+- **One buffer, several windows.** A `Document` handed to two `Editor`s is two views of one file:
+  an edit in either is the edit, either can undo it, and each keeps its own carets, scroll
+  position and theme. A change reports the replacements that made it, in the order they applied —
+  which is what a language server's incremental synchronisation is.
+- **Marks an application draws.** Named layers of bands, squiggles and gutter marks, each naming a
+  custom property of its own, so diagnostics, search hits and git hunks replace one at a time.
+  `point_for_byte` turns a byte into a place on the window, which is what a hover card, an inline
+  diagnostic or a leap label is positioned by.
 - **Mouse.** Click/drag selection with pointer capture and edge autoscroll, double-click word
   and triple-click line selection, middle-click primary-selection paste on Linux, scrollbar
   dragging.
