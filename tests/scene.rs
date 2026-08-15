@@ -24,6 +24,9 @@ use zgui_editor::{Editor, EditorProps};
 const SHEET: &str = zgui::css!(
     "root { display: flex; background: #1e1e2e; color: #cdd6f4; }
     .app { flex: 1; min-width: 0; min-height: 0; }
+    .app__header { height: 30px; flex: none; }
+    .app__body { flex: 1; min-height: 0; min-width: 0; display: flex; }
+    .app__side { width: 120px; flex: none; }
     .app__editor {
         --editor-current-line: rgba(88, 91, 112, 0.4);
         --editor-cursor: #f5e0dc;
@@ -32,7 +35,20 @@ const SHEET: &str = zgui::css!(
     }"
 );
 
+/// The same, with the editor pushed away from the window's origin by a header and a sidebar.
+///
+/// The shape every real application has, and the one a coordinate bug hides from: at the origin,
+/// window coordinates and element coordinates are the same number, so an origin that is never
+/// subtracted looks correct.
+fn mounted_offset(text: &'static str) -> (Harness<Runtime>, EditorHandle) {
+    mounted_with(text, true)
+}
+
 fn mounted(text: &'static str) -> (Harness<Runtime>, EditorHandle) {
+    mounted_with(text, false)
+}
+
+fn mounted_with(text: &'static str, offset: bool) -> (Harness<Runtime>, EditorHandle) {
     let taken: Rc<RefCell<Option<EditorHandle>>> = Rc::new(RefCell::new(None));
     let fonts = zgui::app::Fonts::shipped_only();
     let context_fonts = fonts.clone();
@@ -59,18 +75,27 @@ fn mounted(text: &'static str) -> (Harness<Runtime>, EditorHandle) {
             .with_custom(Box::new(|_document| zgui::custom::sources()))
             .into_handler(move |cx: &mut BuildCx<'_>| -> Box<dyn Anchor> {
                 let taken = Rc::clone(&taken);
-                let view = view! {
-                    column(class = "app") {
-                        Editor(
-                            class = "app__editor",
-                            text = text,
-                            on_ready = Box::new(move |handle: EditorHandle| {
-                                *taken.borrow_mut() = Some(handle);
-                            }) as Box<dyn Fn(EditorHandle)>,
-                        )
-                    }
-                };
+                let on_ready = Box::new(move |handle: EditorHandle| {
+                    *taken.borrow_mut() = Some(handle);
+                }) as Box<dyn Fn(EditorHandle)>;
                 use zgui::view::IntoView;
+                let view: zgui::view::AnyView = if offset {
+                    zgui::view::AnyView::new(view! {
+                        column(class = "app") {
+                            box(class = "app__header") {}
+                            row(class = "app__body") {
+                                box(class = "app__side") {}
+                                Editor(class = "app__editor", text = text, on_ready = on_ready)
+                            }
+                        }
+                    })
+                } else {
+                    zgui::view::AnyView::new(view! {
+                        column(class = "app") {
+                            Editor(class = "app__editor", text = text, on_ready = on_ready)
+                        }
+                    })
+                };
                 Box::new(view.into_view().build(cx))
             })
             .expect("the reactive runtime installs")
@@ -230,4 +255,78 @@ fn the_visible_range_is_inside_the_text() {
     // Slicing the rope with it is the whole point of answering in bytes.
     let seen = handle.query(|snapshot| snapshot.text_in(visible.clone()));
     assert!(seen.starts_with("one"));
+}
+
+#[test]
+fn a_byte_maps_to_the_window_even_when_the_editor_is_not_at_the_origin() {
+    // The shape every application has: a header above and a sidebar beside. A point mapping that
+    // forgets the element's own origin is exactly right at (0, 0) and wrong everywhere else, so
+    // this is the test that can tell.
+    let (mut harness, handle) = mounted_offset("fn main() {\n    let greeting = \"hello\";\n}\n");
+    harness.settle(8);
+
+    let start = handle
+        .point_for_byte(0)
+        .expect("the first byte is on screen");
+    assert!(
+        start.x >= 120.0,
+        "the first byte is to the right of the sidebar, not at the window's edge: {start:?}"
+    );
+    assert!(
+        start.y >= 30.0,
+        "and below the header: {start:?}"
+    );
+
+    // And back again: the point the first byte is at is the first byte.
+    let back = handle
+        .byte_for_point(start.x + 1.0, start.y + start.height / 2.0)
+        .expect("the point is inside the editor");
+    assert_eq!(
+        handle.query(|snapshot| snapshot.line_col(back).line),
+        0,
+        "the round trip stays on the line it started on"
+    );
+}
+
+#[test]
+fn a_point_maps_to_the_line_under_it_when_the_editor_is_offset() {
+    let (mut harness, handle) = mounted_offset("one\ntwo\nthree\nfour\nfive\nsix\n");
+    harness.settle(8);
+
+    // Every line, by the middle of the row `point_for_byte` says it is on.
+    for line in 0..6usize {
+        let byte = handle.query(|snapshot| {
+            let rope = snapshot.rope();
+            rope.char_to_byte(rope.line_to_char(line))
+        });
+        let Some(at) = handle.point_for_byte(byte) else {
+            continue;
+        };
+        let back = handle
+            .byte_for_point(at.x + 1.0, at.y + at.height / 2.0)
+            .unwrap_or_else(|| panic!("line {line} at {at:?} is inside the editor"));
+        assert_eq!(
+            handle.query(|snapshot| snapshot.line_col(back).line),
+            line,
+            "clicking the middle of line {line}'s row lands on line {line}"
+        );
+    }
+}
+
+/// The element-local position of a byte, which is what an overlay drawn inside the editor wants.
+#[test]
+fn a_byte_maps_to_a_place_inside_the_element_too() {
+    let (mut harness, handle) = mounted_offset("one\ntwo\nthree\n");
+    harness.settle(8);
+
+    let window = handle.point_for_byte(0).expect("on screen");
+    let local = handle.local_point_for_byte(0).expect("on screen");
+
+    assert!(
+        local.x < window.x && local.y < window.y,
+        "the element's own origin is subtracted: {local:?} against {window:?}"
+    );
+    // The first byte sits at the gutter's right edge, a little in from the element's left, and on
+    // its first row.
+    assert!(local.y < window.height, "the first line is the top row");
 }

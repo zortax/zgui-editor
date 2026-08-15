@@ -455,12 +455,36 @@ impl EditorHandle {
         self.point_in(&mut shared, byte)
     }
 
+    /// Where `byte` is *inside the editor's own box*, in CSS pixels. `None` when it is not on
+    /// screen.
+    ///
+    /// The same place as [`point_for_byte`](Self::point_for_byte), measured from the element
+    /// rather than from the window. What an overlay drawn inside the editor wants: a label placed
+    /// with `position: absolute` in a box that fills the editor is positioned against the
+    /// element's padding box, so a window coordinate would be out by wherever the editor happens
+    /// to sit — which is exactly right at the origin and wrong everywhere else.
+    #[must_use]
+    pub fn local_point_for_byte(&self, byte: usize) -> Option<CaretRect> {
+        let mut shared = self.ctx.shared.borrow_mut();
+        let (line, x) = shared.caret_position(byte);
+        if !shared.visible_lines().contains(&line) {
+            return None;
+        }
+        let scale = shared.metrics.scale.max(0.001);
+        Some(CaretRect {
+            x: (shared.gutter_width() - shared.scroll.pos.x_px as f32 + x) / scale,
+            y: shared.line_y(line) / scale,
+            width: 2.0,
+            height: shared.metrics.line_height / scale,
+        })
+    }
+
     /// Which byte a place on the window lands on, in CSS pixels. `None` when it is outside.
     ///
     /// The inverse of [`point_for_byte`](Self::point_for_byte), and what a click in a decoration
     /// an application drew over the editor has to be turned back into.
     pub fn byte_for_point(&self, x: f32, y: f32) -> Option<usize> {
-        let bounds = self.ctx.port.bounds()?;
+        let bounds = self.ctx.port.window_bounds()?;
         let mut shared = self.ctx.shared.borrow_mut();
         let scale = shared.metrics.scale.max(0.001);
         let local_x = x * scale - bounds.origin.x.0;
@@ -785,7 +809,10 @@ impl EditorHandle {
         if !shared.visible_lines().contains(&line) {
             return None;
         }
-        let bounds = self.ctx.port.bounds()?;
+        // The window's space, not the parent's: `bounds` stops at the parent's border box, so an
+        // editor inside anything at all would answer a place that is short by however far its
+        // ancestors are down and across the window.
+        let bounds = self.ctx.port.window_bounds()?;
         let scale = shared.metrics.scale.max(0.001);
         let element_x = shared.gutter_width() - shared.scroll.pos.x_px as f32 + x;
         let element_y = shared.line_y(line);

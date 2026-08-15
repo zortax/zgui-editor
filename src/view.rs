@@ -314,8 +314,13 @@ pub fn Editor(
     };
 
     // Where a pointer event landed, in element-local device pixels.
+    //
+    // Against the *window* box. `bounds` is relative to the parent, so it is the element's offset
+    // inside whatever holds it — which is exactly right for an editor that fills the window and
+    // wrong by the height of a header for one that does not. A caret that lands a line or two
+    // from the pointer is this.
     let local_point = move |position: zgui::geom::Point<zgui::geom::CssPx, zgui::geom::Css>| {
-        let bounds = port.bounds()?;
+        let bounds = port.window_bounds()?;
         let scale = port.scale();
         Some((
             position.x.0 * scale - bounds.origin.x.0,
