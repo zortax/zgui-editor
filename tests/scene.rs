@@ -272,10 +272,7 @@ fn a_byte_maps_to_the_window_even_when_the_editor_is_not_at_the_origin() {
         start.x >= 120.0,
         "the first byte is to the right of the sidebar, not at the window's edge: {start:?}"
     );
-    assert!(
-        start.y >= 30.0,
-        "and below the header: {start:?}"
-    );
+    assert!(start.y >= 30.0, "and below the header: {start:?}");
 
     // And back again: the point the first byte is at is the first byte.
     let back = handle
@@ -329,4 +326,61 @@ fn a_byte_maps_to_a_place_inside_the_element_too() {
     // The first byte sits at the gutter's right edge, a little in from the element's left, and on
     // its first row.
     assert!(local.y < window.height, "the first line is the top row");
+}
+
+/// The wheel glide, end to end: refresh-paced steps that park exactly at the target.
+///
+/// The glide is a frame callback that re-arms itself, so the window counts as animating while it
+/// is short of its target and owes nothing once it lands. A regression to a wall-clock timer
+/// shows up here twice over: the window stops reporting the glide as an animation, and the steps
+/// stop lining up with the frames the harness drives.
+#[test]
+fn a_wheel_glide_steps_every_frame_and_parks_at_its_target() {
+    let text: &'static str = Box::leak("line\n".repeat(200).into_boxed_str());
+    let (mut harness, handle) = mounted(text);
+    harness.platform().offscreens()[0].set_refresh_rate_millihertz(Some(60_000));
+    harness.settle(8);
+
+    // One notch of a discrete wheel over the editor: three lines under the default config.
+    harness.deliver_to_first(SurfaceEvent::Wheel {
+        event: zgui::vocab::WheelEvent {
+            delta: zgui::vocab::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+            phase: zgui::vocab::ScrollPhase::Discrete,
+            position: zgui::geom::Point::new(zgui::geom::CssPx(320.0), zgui::geom::CssPx(240.0)),
+            id: zgui::vocab::PointerId::MOUSE,
+            kind: zgui::vocab::PointerKind::Mouse,
+        },
+        modifiers: zgui::vocab::Modifiers::NONE,
+        timestamp: zgui::vocab::Timestamp::ORIGIN,
+    });
+    harness.settle(8);
+    assert!(
+        harness.app().windows()[0].is_animating(),
+        "the glide is a pending frame callback, so the window owes refresh-paced frames"
+    );
+
+    let mut tops = vec![handle.scroll_state().get_untracked().top_line];
+    for _ in 0..90 {
+        harness.advance(std::time::Duration::from_millis(17));
+        harness.settle(4);
+        tops.push(handle.scroll_state().get_untracked().top_line);
+    }
+
+    assert!(
+        tops.windows(2).all(|pair| pair[1] >= pair[0]),
+        "the view never moves backwards: {tops:?}"
+    );
+    let top = *tops.last().expect("read at least once");
+    assert!(
+        (top - 3.0).abs() < 1e-9,
+        "the glide parks exactly at its target: {top}"
+    );
+    assert!(
+        tops.iter().filter(|top| **top > 0.0 && **top < 3.0).count() >= 3,
+        "the motion is made of steps rather than a jump: {tops:?}"
+    );
+    assert!(
+        !harness.app().windows()[0].is_animating(),
+        "a finished glide leaves nothing pending"
+    );
 }

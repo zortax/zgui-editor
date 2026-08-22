@@ -17,7 +17,6 @@ pub mod words;
 
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::Instant;
 
 use ropey::Rope;
 
@@ -133,6 +132,19 @@ impl DocumentState {
         Self {
             buffer: Buffer::from_str(text),
             history: History::new(),
+            options: EditOptions::default(),
+        }
+    }
+
+    /// A document over `text` that already has `history` behind it.
+    ///
+    /// What a restored session builds. A document made empty and then filled through
+    /// [`EditorState::set_text`] would have its history cleared by the filling, which is exactly
+    /// right for opening a file and exactly wrong for putting one back.
+    pub fn restore(text: &str, history: History) -> Self {
+        Self {
+            buffer: Buffer::from_str(text),
+            history,
             options: EditOptions::default(),
         }
     }
@@ -490,7 +502,13 @@ impl EditorState<'_> {
             })
             .collect();
 
-        let mut tx = Transaction::new(edits, before.clone(), before.clone(), kind, Instant::now());
+        let mut tx = Transaction::new(
+            edits,
+            before.clone(),
+            before.clone(),
+            kind,
+            crate::core::edit::EditTime::now(),
+        );
         self.doc.buffer.apply(&tx.edits);
 
         // Where the selections land: mapped through the edits, or where the caller said.

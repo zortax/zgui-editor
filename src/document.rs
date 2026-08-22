@@ -33,9 +33,13 @@
 //! second view is a second window onto the same text, not a second source of events.
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
+use std::ops::Range;
 use std::rc::{Rc, Weak};
 
-use crate::core::{ChangeInfo, DocumentState};
+use crate::command::Command;
+use crate::core::motion::MotionContext;
+use crate::core::selection::Selections;
+use crate::core::{ChangeInfo, DocumentState, EditorState};
 use crate::handle::{EditorCtx, EditorHandle};
 
 /// Which view of a document this is.
@@ -82,6 +86,84 @@ impl Document {
                 views: RefCell::new(Vec::new()),
                 next: Cell::new(0),
             }),
+        }
+    }
+
+    /// A document over `text` that already has `history` behind it.
+    ///
+    /// What a session restores with. No view has attached yet, so there is nothing to tell about
+    /// the text and no cache to make stale; handing this to an editor is the same as handing it a
+    /// document read from a file, except that undo reaches back past the restart.
+    pub fn restore(text: &str, history: crate::core::history::History) -> Self {
+        Self {
+            inner: Rc::new(DocumentInner {
+                state: RefCell::new(DocumentState::restore(text, history)),
+                views: RefCell::new(Vec::new()),
+                next: Cell::new(0),
+            }),
+        }
+    }
+
+    /// Reads the undo history, for something that is writing it down.
+    pub fn with_history<R>(&self, read: impl FnOnce(&crate::core::history::History) -> R) -> R {
+        read(&self.inner.state.borrow().history)
+    }
+
+    /// Replaces `replacements` in the text, with no view acting.
+    ///
+    /// What something that is not an editor edits through: a cell in a table, an attribute in a
+    /// drawing, a checkbox in a rendered document. The change goes into the shared history, so
+    /// undo in a text view of the same buffer takes it back, and every view is told.
+    ///
+    /// One view also *reports* it, as [`EditorEvent::Edited`](crate::EditorEvent::Edited). An
+    /// application hangs its dirty mark, its session writes and its language servers off that
+    /// event, and a change nobody acted for would otherwise reach none of them.
+    ///
+    /// Each range addresses the text as it is now. Overlapping ranges are a caller mistake and
+    /// the earlier one wins, which is what [`Command::ReplaceRanges`] does. Answers whether
+    /// anything changed: a read-only document, and a list that inserts nothing anywhere, both
+    /// answer `false`.
+    ///
+    /// ```
+    /// # use zgui_editor::Document;
+    /// let document = Document::new("a,b\n1,2\n");
+    /// assert!(document.apply(vec![(4..5, "9".to_owned())]));
+    /// assert_eq!(document.text(), "a,b\n9,2\n");
+    /// ```
+    pub fn apply(&self, replacements: Vec<(Range<usize>, String)>) -> bool {
+        // Where undo puts the caret afterwards, which is the earliest byte the change touched.
+        // A caret at zero would send somebody who undid a change at the end of a file to the top
+        // of it.
+        let at = replacements
+            .iter()
+            .map(|(range, _)| range.start)
+            .min()
+            .unwrap_or(0);
+
+        let change = {
+            let mut state = self.inner.state.borrow_mut();
+            let at = crate::core::position::snap(state.buffer.rope(), at);
+            let mut selections = Selections::caret(at);
+            EditorState {
+                doc: &mut state,
+                selections: &mut selections,
+            }
+            .apply(
+                &Command::ReplaceRanges(replacements),
+                // No view acts, so no motion resolves and the page size is never read.
+                MotionContext { viewport_lines: 1 },
+            )
+            .change
+        };
+
+        // Told outside the borrow: a view hearing about a change reads the document.
+        match change {
+            Some(change) => {
+                self.tell(&change, None);
+                self.report(&change);
+                true
+            }
+            None => false,
         }
     }
 
@@ -147,19 +229,48 @@ impl Document {
     }
 
     /// Tells every view but `actor` that the text changed under it.
+    pub(crate) fn broadcast(&self, change: &ChangeInfo, actor: ViewId) {
+        self.tell(change, Some(actor));
+    }
+
+    /// Reports `change` to the application, through the first view that is listening.
+    ///
+    /// One report for one change: an edit made by a view is reported by that view, and this is the
+    /// same rule for an edit made by nobody. A document with no view has nothing to report through
+    /// and nothing showing it either.
+    fn report(&self, change: &ChangeInfo) {
+        let revision = self.revision();
+        let listeners: Vec<Rc<EditorCtx>> = {
+            let views = self.inner.views.borrow();
+            views
+                .iter()
+                .filter_map(|(_, weak)| weak.upgrade())
+                .collect()
+        };
+        for ctx in listeners {
+            let report = ctx.on_event.borrow();
+            if let Some(tell) = report.as_ref() {
+                tell(crate::EditorEvent::Edited {
+                    kind: change.kind,
+                    revision,
+                    changes: std::sync::Arc::clone(&change.changes),
+                });
+                return;
+            }
+        }
+    }
+
+    /// Tells every view except `actor`, or every view at all when nothing acted.
     ///
     /// The list is copied out before anything is told, because telling a view makes it read the
     /// document — and a borrow held across that is a panic rather than a bug that can be found by
     /// reading the two functions side by side.
-    pub(crate) fn broadcast(&self, change: &ChangeInfo, actor: ViewId) {
+    fn tell(&self, change: &ChangeInfo, actor: Option<ViewId>) {
         let others: Vec<Rc<EditorCtx>> = {
             let views = self.inner.views.borrow();
-            if views.len() < 2 {
-                return;
-            }
             views
                 .iter()
-                .filter(|(id, _)| *id != actor)
+                .filter(|(id, _)| Some(*id) != actor)
                 .filter_map(|(_, weak)| weak.upgrade())
                 .collect()
         };
@@ -190,6 +301,61 @@ mod tests {
         assert!(one.is(&two));
         assert!(!one.is(&Document::new("hello")));
         assert_eq!(two.text(), "hello");
+    }
+
+    #[test]
+    fn an_applied_change_moves_the_revision() {
+        let document = Document::new("one\ntwo\n");
+        let before = document.revision();
+        assert!(document.apply(vec![(4..7, "TWO".to_owned())]));
+        assert_eq!(document.text(), "one\nTWO\n");
+        assert_ne!(document.revision(), before);
+    }
+
+    #[test]
+    fn several_replacements_apply_as_one() {
+        // Each range addresses the text as it is now, so two edits in one call must not shift
+        // one another.
+        let document = Document::new("a,b,c\n");
+        assert!(document.apply(vec![(0..1, "xx".to_owned()), (4..5, "yy".to_owned())]));
+        assert_eq!(document.text(), "xx,b,yy\n");
+    }
+
+    #[test]
+    fn an_applied_change_undoes() {
+        // The whole reason it goes through the shared history: `u` in a text view of the same
+        // buffer takes back what a table or a drawing did.
+        let document = Document::new("one\n");
+        document.apply(vec![(0..3, "two".to_owned())]);
+        assert_eq!(document.text(), "two\n");
+
+        let mut selections = crate::core::selection::Selections::caret(0);
+        let mut state = document.inner.state.borrow_mut();
+        crate::core::EditorState {
+            doc: &mut state,
+            selections: &mut selections,
+        }
+        .apply(
+            &crate::command::Command::Undo,
+            crate::core::motion::MotionContext { viewport_lines: 1 },
+        );
+        assert_eq!(state.buffer.to_string(), "one\n");
+    }
+
+    #[test]
+    fn a_change_that_changes_nothing_says_so() {
+        let document = Document::new("text");
+        assert!(!document.apply(Vec::new()));
+        assert!(!document.apply(vec![(2..2, String::new())]));
+        assert_eq!(document.revision(), Document::new("text").revision());
+    }
+
+    #[test]
+    fn a_read_only_document_refuses() {
+        let document = Document::new("text");
+        document.inner.state.borrow_mut().options.read_only = true;
+        assert!(!document.apply(vec![(0..4, "other".to_owned())]));
+        assert_eq!(document.text(), "text");
     }
 
     #[test]

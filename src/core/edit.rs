@@ -7,11 +7,47 @@
 //! before itself.
 
 use std::ops::Range;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ropey::Rope;
 
 use crate::core::selection::Selections;
+
+/// When a transaction happened.
+///
+/// Milliseconds since the first time this crate was asked. An [`Instant`] cannot be written down
+/// and means nothing across a process anyway; what the number is for is one comparison against
+/// [`COALESCE_WINDOW`](crate::core::history::COALESCE_WINDOW), and a number does that.
+///
+/// A session restored from disk brings times from a previous run's origin. Comparing those to
+/// this run's is meaningless, so [`since`](Self::since) saturates: a restored transaction is
+/// never *later* than a live one, and a restored history is sealed anyway.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct EditTime(pub u64);
+
+impl EditTime {
+    /// Now.
+    #[must_use]
+    pub fn now() -> Self {
+        static ORIGIN: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+        Self(ORIGIN.elapsed().as_millis() as u64)
+    }
+
+    /// How long after `earlier` this is, or nothing when it is not after it at all.
+    #[must_use]
+    pub fn since(self, earlier: Self) -> Duration {
+        Duration::from_millis(self.0.saturating_sub(earlier.0))
+    }
+}
+
+impl std::ops::Add<Duration> for EditTime {
+    type Output = Self;
+
+    fn add(self, later: Duration) -> Self {
+        Self(self.0.saturating_add(later.as_millis() as u64))
+    }
+}
 
 /// One replacement: `deleted` at `range` gives way to `inserted`.
 ///
@@ -19,6 +55,7 @@ use crate::core::selection::Selections;
 /// redundantly with the buffer, but it is what makes the transaction invertible after the buffer
 /// has moved on.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Edit {
     /// The bytes replaced.
     pub range: Range<usize>,
@@ -74,6 +111,8 @@ pub fn map_through(changes: &[TextChange], byte: usize) -> usize {
 /// What kind of change a transaction is, which is what decides whether it folds into the
 /// undo step before it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum EditKind {
     /// Characters typed at the carets.
     Typing,
@@ -89,6 +128,7 @@ pub enum EditKind {
 
 /// One applied (or applicable) change: the edits, the selections around them, and when.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Transaction {
     /// The edits, sorted by start descending, disjoint.
     pub edits: Vec<Edit>,
@@ -99,7 +139,7 @@ pub struct Transaction {
     /// What kind of change this is.
     pub kind: EditKind,
     /// When it happened, which is what bounds undo coalescing.
-    pub at: Instant,
+    pub at: EditTime,
 }
 
 impl Transaction {
@@ -109,7 +149,7 @@ impl Transaction {
         before: Selections,
         after: Selections,
         kind: EditKind,
-        at: Instant,
+        at: EditTime,
     ) -> Self {
         edits.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
         Self {
@@ -232,7 +272,7 @@ impl Transaction {
         if !matches!(self.kind, EditKind::Typing | EditKind::Deletion) {
             return false;
         }
-        self.at.duration_since(earlier.at) <= window
+        self.at.since(earlier.at) <= window
     }
 }
 
@@ -270,7 +310,7 @@ mod tests {
             Selections::caret(0),
             Selections::caret(0),
             EditKind::Other,
-            Instant::now(),
+            EditTime::now(),
         )
     }
 

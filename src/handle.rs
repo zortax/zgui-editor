@@ -23,6 +23,7 @@ use crate::core::{ChangeInfo, EditorState, Response, ScrollEffect, position, sea
 use crate::decoration::{Decoration, GutterMark};
 use crate::document::{Document, ViewId};
 use crate::event::EditorEvent;
+use crate::overlay::Overlay;
 use crate::render::element::EditorElement;
 use crate::render::shared::EditorShared;
 use crate::syntax::registry::LanguageRegistry;
@@ -39,12 +40,25 @@ pub struct CursorPos {
 /// Where the view sits, as a scrollbar or minimap outside the component would draw it.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct ScrollSnapshot {
-    /// The line at the top of the view, fractionally.
+    /// The line at the top of the view, fractionally, right now.
+    ///
+    /// Mid-glide this is where the view has reached, which is what a scrollbar draws and what
+    /// anything writing the position down should *not* use: see [`Self::target_line`].
     pub top_line: f64,
+    /// The line the view is heading for. Equal to [`Self::top_line`] at rest.
+    ///
+    /// What to write down. A jump glides, so the moment a scroll is reported the view has barely
+    /// begun to move, and the position recorded then would be the one it was leaving.
+    pub target_line: f64,
     /// The greatest top line the document allows.
     pub max_top: f64,
     /// How many lines the view shows.
     pub viewport_lines: f64,
+    /// How far the text is scrolled left, in device pixels.
+    ///
+    /// What a session writes down beside the top line: a view put back at the right line but at
+    /// the left margin is a view that moved.
+    pub x_px: f64,
 }
 
 /// Where the primary caret sits on the window, in CSS pixels — what anchors a popover.
@@ -216,6 +230,22 @@ pub(crate) struct EditorCtx {
 pub struct EditorHandle {
     pub(crate) ctx: Rc<EditorCtx>,
 }
+
+/// Two handles are equal when they drive the same editor, not when they say the same things.
+///
+/// Identity is what a caller keeping a registry of mounted editors needs. A view rebuilt in place
+/// — a pane the layout has just re-created around the same window and the same buffer — registers
+/// the new editor *before* the old one's cleanup runs, so a registry that forgets by key alone
+/// deletes the live entry on the way out and is left holding nothing for a pane that is on the
+/// screen. Asking "is the one I am holding the one that is going away?" is the whole of the fix,
+/// and it needs the handle to be comparable.
+impl PartialEq for EditorHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.ctx, &other.ctx)
+    }
+}
+
+impl Eq for EditorHandle {}
 
 impl EditorHandle {
     pub(crate) fn new(
@@ -397,9 +427,43 @@ impl EditorHandle {
         }
     }
 
+    /// Replaces the bands and the carets the application paints itself.
+    ///
+    /// What a modal layer's visual modes are drawn with; see [`overlay`](crate::overlay). An empty
+    /// overlay hands the painting back to the selections.
+    pub fn set_overlay(&self, overlay: Overlay) {
+        {
+            let mut shared = self.ctx.shared.borrow_mut();
+            if shared.overlay == overlay {
+                return;
+            }
+            shared.overlay = overlay;
+            shared.blink_on = true;
+            // The overlay moves the caret, and a status line reads where the caret is.
+            self.update_signals(&mut shared);
+        }
+        self.ctx.element.repaint();
+    }
+
     /// Changes what the caret looks like — a vim layer's mode change.
     pub fn set_cursor_style(&self, style: CursorStyle) {
         self.ctx.shared.borrow_mut().config.cursor_style = style;
+        self.ctx.element.repaint();
+    }
+
+    /// Says whether this is the view a person is working in.
+    ///
+    /// What the caret's own line band follows. Separate from focus: an editor under a picker or a
+    /// command line is still the view being worked in, and keeps its band. An application showing
+    /// one editor never has to call this.
+    pub fn set_active(&self, active: bool) {
+        {
+            let mut shared = self.ctx.shared.borrow_mut();
+            if shared.active == active {
+                return;
+            }
+            shared.active = active;
+        }
         self.ctx.element.repaint();
     }
 
@@ -407,6 +471,30 @@ impl EditorHandle {
     pub fn set_gutter(&self, mode: GutterMode) {
         self.ctx.shared.borrow_mut().config.gutter = mode;
         self.ctx.element.relayout();
+    }
+
+    /// Says which lines the view draws, or that it draws all of them.
+    ///
+    /// The window moves as the caret moves between blocks of a rendered document, so it is set
+    /// here rather than only at build time: an editor unmounted to change which lines it shows
+    /// would lose its carets, its history and its parsed tree every time somebody pressed a key.
+    ///
+    /// The view relays out, because a window is what decides how tall it is.
+    pub fn set_line_window(&self, window: Option<std::ops::Range<usize>>) {
+        {
+            let mut shared = self.ctx.shared.borrow_mut();
+            if shared.config.line_window == window {
+                return;
+            }
+            shared.config.line_window = window;
+        }
+        self.ctx.element.relayout();
+    }
+
+    /// Which lines the view draws, when it draws only some of them.
+    #[must_use]
+    pub fn line_window(&self) -> Option<std::ops::Range<usize>> {
+        self.ctx.shared.borrow().config.line_window.clone()
     }
 
     /// Gives the editor focus.
@@ -685,16 +773,14 @@ impl EditorHandle {
         }
     }
 
-    /// How far a caret-following scroll may move and still snap rather than glide, in lines.
-    ///
-    /// Typing at the viewport's edge moves the view a line at a time and must never lag; a
-    /// `G`, a search hit or a half-page jump reads far better arriving as motion.
-    const GLIDE_THRESHOLD_LINES: f64 = 4.0;
-
     /// Brings the primary caret into view: instantly for a nudge, gliding for a jump.
     fn ensure_caret_visible(&self, shared: &mut EditorShared) {
-        let head = shared.selections.primary().head;
-        let (line, x) = shared.caret_position(head);
+        // The overlay's caret when it places one: in a block selection that is the only thing that
+        // knows which line the person is steering, and how far past its end.
+        let (line, x) = match shared.overlay.carets.first().copied() {
+            Some(caret) => (caret.line, shared.cell_x(caret.line, caret.column)),
+            None => shared.caret_position(shared.selections.primary().head),
+        };
         let total = shared.line_count();
         let viewport = shared.viewport_lines();
         let scrolloff = shared.config.scrolloff;
@@ -704,7 +790,7 @@ impl EditorHandle {
         let mut probe = shared.scroll;
         if probe.ensure_visible(line, scrolloff, total, viewport) {
             let distance = (probe.pos.line - before).abs();
-            if shared.config.smooth_scroll && distance > Self::GLIDE_THRESHOLD_LINES {
+            if shared.config.smooth_scroll && distance > shared.config.glide_threshold_lines {
                 shared.scroll.target_line = probe.pos.line;
             } else {
                 shared.scroll = probe;
@@ -760,6 +846,15 @@ impl EditorHandle {
                 let max = (f64::from(shared.horizontal_extent()) - text_width).max(0.0);
                 shared.scroll.pos.x_px = (shared.scroll.pos.x_px + px).clamp(0.0, max);
             }
+            ScrollCmd::ToExact { line, x_px } => {
+                // Both at once, and never a `ToLine` followed by a `HorizontalPx`: two commands
+                // are two frames of the wrong picture, and `ToLine` cannot say "half-way down
+                // line two" in the first place.
+                shared.scroll.scroll_to(line, total, viewport);
+                let text_width = f64::from(shared.text_area_width());
+                let max = (f64::from(shared.horizontal_extent()) - text_width).max(0.0);
+                shared.scroll.pos.x_px = x_px.clamp(0.0, max);
+            }
             ScrollCmd::EnsureCursorVisible => self.ensure_caret_visible(shared),
         }
     }
@@ -768,7 +863,11 @@ impl EditorHandle {
     pub(crate) fn update_signals(&self, shared: &mut EditorShared) {
         let primary = shared.selections.primary();
         let rope = shared.rope();
-        let (line, col) = position::line_col(&rope, primary.head);
+        // Where the caret is drawn is where a status line must say it is.
+        let (line, col) = match shared.overlay.carets.first() {
+            Some(caret) => (caret.line, caret.column as usize),
+            None => position::line_col(&rope, primary.head),
+        };
         self.ctx.signals.revision.set(shared.revision());
         self.ctx.signals.cursor.set(CursorPos { line, col });
         self.ctx.signals.selection.set(primary);
@@ -776,8 +875,10 @@ impl EditorHandle {
         let viewport = shared.viewport_lines();
         self.ctx.signals.scroll.set(ScrollSnapshot {
             top_line: shared.scroll.pos.line,
+            target_line: shared.scroll.target_line,
             max_top: crate::scroll::ScrollState::max_top(total, viewport),
             viewport_lines: viewport,
+            x_px: shared.scroll.pos.x_px,
         });
         self.ctx.signals.caret_rect.set(self.caret_rect_now(shared));
 

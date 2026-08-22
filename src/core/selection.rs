@@ -14,6 +14,7 @@ use crate::core::position::Affinity;
 
 /// One selection: an anchor that stays and a head that moves.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Selection {
     /// The end that stays put when the selection extends.
     pub anchor: usize,
@@ -81,9 +82,44 @@ impl Selection {
 
 /// Every selection, in document order, with a primary among them.
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(from = "Wire", into = "Wire")
+)]
 pub struct Selections {
     list: SmallVec<[Selection; 1]>,
     primary: usize,
+}
+
+/// What a set of selections is written down as.
+///
+/// Decoding goes back through [`Selections::new`], which sorts, merges and clamps, so a file
+/// nobody wrote by hand still cannot produce a set that breaks the invariants everything else
+/// depends on.
+#[cfg(feature = "serde")]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Wire {
+    list: Vec<Selection>,
+    primary: usize,
+}
+
+#[cfg(feature = "serde")]
+impl From<Wire> for Selections {
+    fn from(wire: Wire) -> Self {
+        Self::new(wire.list, wire.primary)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl From<Selections> for Wire {
+    fn from(selections: Selections) -> Self {
+        Self {
+            primary: selections.primary,
+            list: selections.list.into_vec(),
+        }
+    }
 }
 
 impl Selections {
@@ -122,6 +158,13 @@ impl Selections {
     /// Whether there is exactly one selection.
     pub fn is_empty(&self) -> bool {
         false
+    }
+
+    /// Which of them is the primary, by its place in the list.
+    ///
+    /// For writing a set of selections down, where the index is what names the primary.
+    pub fn primary_index(&self) -> usize {
+        self.primary.min(self.list.len() - 1)
     }
 
     /// The primary selection, the one the viewport follows and the status line reports.

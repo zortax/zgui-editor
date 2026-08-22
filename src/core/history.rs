@@ -18,6 +18,7 @@ pub const COALESCE_WINDOW: Duration = Duration::from_millis(750);
 
 /// One undoable step: one or more transactions that undo together.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Step {
     /// The transactions, oldest first.
     pub transactions: Vec<Transaction>,
@@ -86,17 +87,90 @@ impl History {
     pub fn undo_depth(&self) -> usize {
         self.undo.len()
     }
+
+    /// The steps that can be undone, oldest first.
+    ///
+    /// For writing a history down. The stacks are private because pushing to them out of order
+    /// would make undo apply edits against text they were never valid in.
+    pub fn undo_steps(&self) -> &[Step] {
+        &self.undo
+    }
+
+    /// The steps that can be redone, the next one last.
+    pub fn redo_steps(&self) -> &[Step] {
+        &self.redo
+    }
+
+    /// A history holding `undo` and `redo`, sealed.
+    ///
+    /// What a restored document is built with. Sealed, because whatever is typed next is a new
+    /// thought however close together the two runs happened to be, and because the times in a
+    /// restored step came from another run's clock.
+    pub fn from_parts(undo: Vec<Step>, redo: Vec<Step>) -> Self {
+        Self {
+            undo,
+            redo,
+            open: false,
+        }
+    }
+
+    /// How many bytes of replaced and replacing text the whole history holds.
+    ///
+    /// What decides whether it is small enough to be worth writing down.
+    pub fn text_bytes(&self) -> usize {
+        let of = |steps: &Vec<Step>| {
+            steps
+                .iter()
+                .flat_map(|step| step.transactions.iter())
+                .flat_map(|tx| tx.edits.iter())
+                .map(|edit| edit.inserted.len() + edit.deleted.len())
+                .sum::<usize>()
+        };
+        of(&self.undo) + of(&self.redo)
+    }
+
+    /// Drops the oldest steps until at most `steps` remain and their text is under `bytes`.
+    ///
+    /// The oldest, because the recent ones are the ones anybody undoes. Answers whether anything
+    /// was dropped, so a session can say so rather than quietly shortening somebody's history.
+    ///
+    /// The redo stack is capped by `steps` as well: nobody redoes across a restart, so it is the
+    /// first thing worth losing.
+    pub fn trim(&mut self, steps: usize, bytes: usize) -> bool {
+        let before = (self.undo.len(), self.redo.len());
+
+        if self.redo.len() > steps {
+            let over = self.redo.len() - steps;
+            self.redo.drain(..over);
+        }
+        if self.undo.len() > steps {
+            let over = self.undo.len() - steps;
+            self.undo.drain(..over);
+        }
+        while self.text_bytes() > bytes {
+            // The redo stack first: it is the half nobody comes back to.
+            if self.redo.is_empty() && self.undo.is_empty() {
+                break;
+            }
+            if !self.redo.is_empty() {
+                self.redo.remove(0);
+            } else {
+                self.undo.remove(0);
+            }
+        }
+
+        before != (self.undo.len(), self.redo.len())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
 
     use super::*;
-    use crate::core::edit::{Edit, EditKind};
+    use crate::core::edit::{Edit, EditKind, EditTime};
     use crate::core::selection::Selections;
 
-    fn typing(at: Instant, range: std::ops::Range<usize>, text: &str) -> Transaction {
+    fn typing(at: EditTime, range: std::ops::Range<usize>, text: &str) -> Transaction {
         Transaction {
             edits: vec![Edit {
                 range,
@@ -112,7 +186,7 @@ mod tests {
 
     #[test]
     fn quick_typing_is_one_step() {
-        let start = Instant::now();
+        let start = EditTime::now();
         let mut history = History::new();
         history.push(typing(start, 0..0, "a"));
         history.push(typing(start + Duration::from_millis(100), 1..1, "b"));
@@ -127,7 +201,7 @@ mod tests {
 
     #[test]
     fn a_pause_starts_a_new_step() {
-        let start = Instant::now();
+        let start = EditTime::now();
         let mut history = History::new();
         history.push(typing(start, 0..0, "a"));
         history.push(typing(start + Duration::from_secs(3), 1..1, "b"));
@@ -136,7 +210,7 @@ mod tests {
 
     #[test]
     fn sealing_starts_a_new_step() {
-        let start = Instant::now();
+        let start = EditTime::now();
         let mut history = History::new();
         history.push(typing(start, 0..0, "a"));
         history.seal();
@@ -146,7 +220,7 @@ mod tests {
 
     #[test]
     fn undo_and_redo_round_trip() {
-        let start = Instant::now();
+        let start = EditTime::now();
         let mut history = History::new();
         history.push(typing(start, 0..0, "a"));
         history.push(typing(start + Duration::from_millis(10), 1..1, "b"));
@@ -159,12 +233,87 @@ mod tests {
 
     #[test]
     fn a_new_change_clears_redo() {
-        let start = Instant::now();
+        let start = EditTime::now();
         let mut history = History::new();
         history.push(typing(start, 0..0, "a"));
         history.seal();
         let _ = history.undo();
         history.push(typing(start + Duration::from_millis(10), 0..0, "c"));
         assert!(history.redo().is_none());
+    }
+}
+
+#[cfg(test)]
+mod restoring {
+    use super::*;
+    use crate::core::edit::{Edit, EditKind, EditTime};
+    use crate::core::selection::Selections;
+
+    fn step(text: &str) -> Step {
+        Step {
+            transactions: vec![Transaction {
+                edits: vec![Edit {
+                    range: 0..0,
+                    inserted: text.to_owned(),
+                    deleted: String::new(),
+                }],
+                before: Selections::caret(0),
+                after: Selections::caret(text.len()),
+                kind: EditKind::Typing,
+                at: EditTime::now(),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_restored_history_can_be_undone() {
+        let mut history = History::from_parts(vec![step("a"), step("b")], Vec::new());
+        assert_eq!(history.undo_depth(), 2);
+        assert!(history.undo().is_some());
+        assert_eq!(history.undo_depth(), 1);
+    }
+
+    #[test]
+    fn a_restored_history_is_sealed() {
+        // Whatever is typed next is a new thought, however close the two runs happened to be.
+        let mut history = History::from_parts(vec![step("a")], Vec::new());
+        history.push(step("b").transactions.remove(0));
+        assert_eq!(history.undo_depth(), 2, "the new change is its own step");
+    }
+
+    #[test]
+    fn the_stacks_can_be_read_back_out() {
+        let history = History::from_parts(vec![step("a")], vec![step("b")]);
+        assert_eq!(history.undo_steps().len(), 1);
+        assert_eq!(history.redo_steps().len(), 1);
+    }
+
+    #[test]
+    fn trimming_drops_the_oldest_steps_first() {
+        let mut history = History::from_parts(
+            vec![step("oldest"), step("middle"), step("newest")],
+            Vec::new(),
+        );
+        assert!(history.trim(2, usize::MAX));
+        assert_eq!(history.undo_steps().len(), 2);
+        // The one anybody would actually undo is the one kept.
+        let kept = &history.undo_steps().last().expect("a step").transactions[0].edits[0].inserted;
+        assert_eq!(kept, "newest");
+    }
+
+    #[test]
+    fn trimming_by_bytes_gives_the_redo_stack_up_first() {
+        let mut history = History::from_parts(vec![step("keep")], vec![step("drop")]);
+        assert!(history.text_bytes() > 4);
+        assert!(history.trim(usize::MAX, 5));
+        assert!(history.redo_steps().is_empty());
+        assert_eq!(history.undo_steps().len(), 1);
+    }
+
+    #[test]
+    fn trimming_something_already_small_enough_changes_nothing() {
+        let mut history = History::from_parts(vec![step("a")], Vec::new());
+        assert!(!history.trim(10, 1024));
+        assert_eq!(history.undo_steps().len(), 1);
     }
 }

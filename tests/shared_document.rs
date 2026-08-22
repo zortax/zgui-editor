@@ -20,6 +20,8 @@ struct Split {
     document: Document,
     left: EditorHandle,
     right: EditorHandle,
+    /// How many times each view reported a change, left first.
+    reports: Rc<RefCell<(usize, usize)>>,
 }
 
 fn split(text: &str) -> Split {
@@ -27,6 +29,7 @@ fn split(text: &str) -> Split {
     window.place(window.root, 0.0, 0.0, 800.0, 600.0);
     let document = Document::new(text);
     let taken: Rc<RefCell<Vec<EditorHandle>>> = Rc::new(RefCell::new(Vec::new()));
+    let reports: Rc<RefCell<(usize, usize)>> = Rc::new(RefCell::new((0, 0)));
 
     let built = {
         let taken = Rc::clone(&taken);
@@ -34,6 +37,8 @@ fn split(text: &str) -> Split {
         window.scope.with(|| {
             let one = Rc::clone(&taken);
             let two = Rc::clone(&taken);
+            let told_left = Rc::clone(&reports);
+            let told_right = Rc::clone(&reports);
             let view = view! {
                 row {
                     Editor(
@@ -41,12 +46,22 @@ fn split(text: &str) -> Split {
                         autofocus = false,
                         on_ready = Box::new(move |handle| one.borrow_mut().push(handle))
                             as Box<dyn Fn(EditorHandle)>,
+                        on_event = Box::new(move |event| {
+                            if matches!(event, zgui_editor::EditorEvent::Edited { .. }) {
+                                told_left.borrow_mut().0 += 1;
+                            }
+                        }) as Box<dyn Fn(zgui_editor::EditorEvent)>,
                     )
                     Editor(
                         document = document.clone(),
                         autofocus = false,
                         on_ready = Box::new(move |handle| two.borrow_mut().push(handle))
                             as Box<dyn Fn(EditorHandle)>,
+                        on_event = Box::new(move |event| {
+                            if matches!(event, zgui_editor::EditorEvent::Edited { .. }) {
+                                told_right.borrow_mut().1 += 1;
+                            }
+                        }) as Box<dyn Fn(zgui_editor::EditorEvent)>,
                     )
                 }
             };
@@ -71,6 +86,7 @@ fn split(text: &str) -> Split {
         document,
         left,
         right,
+        reports,
     }
 }
 
@@ -220,4 +236,57 @@ fn a_deletion_pulls_a_later_caret_back() {
         6,
         "the caret came back with the text"
     );
+}
+
+#[test]
+fn an_edit_with_no_view_acting_reaches_every_view() {
+    // What a table cell or a drawing edits through. No view issued it, so both have to hear it,
+    // including the one a `broadcast` would have called the actor.
+    let split = split("hello world\n");
+    split.right.command(Command::SetSelections {
+        selections: vec![Selection::caret(6)],
+        primary: 0,
+    });
+    split.window.frame();
+
+    assert!(split.document.apply(vec![(0..5, "goodbye".to_string())]));
+    split.window.frame();
+
+    assert_eq!(text_of(&split.left), "goodbye world\n");
+    assert_eq!(text_of(&split.right), "goodbye world\n");
+    assert_eq!(head_of(&split.right), 8, "the caret followed the change");
+    assert_eq!(
+        split.document.revision(),
+        split.left.revision().get(),
+        "both revision signals moved"
+    );
+}
+
+#[test]
+fn a_change_nobody_acted_for_is_reported_once() {
+    // An application hangs its dirty mark, its session writes and its language servers off the
+    // edited event. A change with no view behind it reaches none of them unless one view reports
+    // it — and two views reporting it would count one edit twice.
+    let split = split("one\n");
+    assert_eq!(*split.reports.borrow(), (0, 0));
+
+    split.document.apply(vec![(0..3, "two".to_string())]);
+    split.window.frame();
+
+    let (left, right) = *split.reports.borrow();
+    assert_eq!(left + right, 1, "one change, one report");
+}
+
+#[test]
+fn a_view_undoes_what_no_view_did() {
+    let split = split("one\n");
+    split.document.apply(vec![(0..3, "two".to_string())]);
+    split.window.frame();
+    assert_eq!(text_of(&split.left), "two\n");
+
+    split.left.command(Command::Undo);
+    split.window.frame();
+
+    assert_eq!(text_of(&split.right), "one\n");
+    assert_eq!(head_of(&split.left), 0, "undo landed on the change");
 }

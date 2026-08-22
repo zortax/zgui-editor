@@ -84,6 +84,15 @@ pub enum ScrollCmd {
     CursorBottom,
     /// Horizontally, by device pixels; positive scrolls the text left.
     HorizontalPx(f64),
+    /// Exactly here: a fractional top line and a horizontal offset, both at once.
+    ///
+    /// What puts a view back where a session left it.
+    ToExact {
+        /// The line at the top, fractionally.
+        line: f64,
+        /// How far the text is scrolled left, in device pixels.
+        x_px: f64,
+    },
     /// Until the primary caret is inside the viewport.
     EnsureCursorVisible,
 }

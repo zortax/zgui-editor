@@ -20,6 +20,8 @@ use unicode_segmentation::UnicodeSegmentation;
 /// wrap the distinction only matters at the seam between lines, but the field is carried from the
 /// start so selections survive the day soft wrap arrives.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum Affinity {
     /// The caret belongs to what follows the offset.
     #[default]

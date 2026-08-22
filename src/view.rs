@@ -46,9 +46,6 @@ const SHEET: &str = "zgui-editor";
 /// How often the caret blinks, each way.
 const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 
-/// How often the scroll glide steps while it runs.
-const GLIDE_TICK: Duration = Duration::from_millis(8);
-
 /// A code editor over `text`.
 ///
 /// The component fills the space its container gives it (`flex: 1`), draws entirely through its
@@ -178,50 +175,90 @@ pub fn Editor(
     });
     on_cleanup_local(move || drop(restyle));
 
-    // The scroll glide: an 8ms step timer held only while the view is short of its target.
-    let glide: Rc<RefCell<Option<zgui::view::time::IntervalHandle>>> = Rc::new(RefCell::new(None));
-    let glide_stop: Rc<RefCell<Option<zgui::view::time::TimeoutHandle>>> =
-        Rc::new(RefCell::new(None));
-    let glide_last = Rc::new(Cell::new(Instant::now()));
+    // The clock, taken once here rather than looked up wherever a timer is wanted.
+    //
+    // `set_timeout` and `set_interval` find the window's clock through the reactive context, and a
+    // listener runs under the owner of the node it is attached to. An event delivered to a view
+    // that is on its way out — a focus announcement reaching the pane a split has just replaced —
+    // therefore runs under an owner that is already disposed, where the lookup finds nothing and
+    // the free function panics rather than declining. Held here, the clock is the one this view
+    // was built with for as long as the view exists anywhere, and a view built outside a window
+    // simply has none.
+    let clock = zgui::view::time::Timers::current();
+
+    // The scroll glide: a frame callback re-armed only while the view is short of its target.
+    //
+    // A frame callback rather than an interval, because the two are paced by different things. A
+    // pending frame callback makes the window count as animating, so its frames come at the
+    // display's own refresh interval — one step per frame the output can show, whether that is
+    // sixty or two hundred and forty a second. An interval is wall-clock and knows nothing of the
+    // output: any period written here is wrong on most displays, and a step timer beating against
+    // the vsync grid draws a motion made of uneven steps.
+
+    /// Everything one glide step needs, cloneable into the next frame's callback.
+    #[derive(Clone)]
+    struct Glide {
+        /// The editor state the step advances.
+        shared: Rc<RefCell<EditorShared>>,
+        /// The handle the step publishes through.
+        handle: EditorHandle,
+        /// Where the pending registration is held, which is also the double-start guard.
+        slot: Rc<RefCell<Option<zgui::view::time::FrameHandle>>>,
+        /// The moment the previous step was for, so dt is measured between frame moments.
+        last: Rc<Cell<Option<zgui::view::Timestamp>>>,
+        /// The clock the view was built with. `None` outside a window, where nothing animates.
+        clock: Option<zgui::view::time::Timers>,
+    }
+
+    /// Registers the next step.
+    fn arm(glide: &Glide) -> Option<zgui::view::time::FrameHandle> {
+        let step = glide.clone();
+        glide
+            .clock
+            .as_ref()
+            .map(|clock| clock.request_frame(move |at| tick(&step, at)))
+    }
+
+    /// One step: dt from successive frame moments, never from the wall clock.
+    ///
+    /// The moment handed in is the one the frame is *for*, the same one the framework's own
+    /// animations are sampled against, so a motion measured between them is drawn as even steps.
+    fn tick(glide: &Glide, at: zgui::view::Timestamp) {
+        let dt = glide
+            .last
+            .get()
+            .map_or(0.001, |last| at.saturating_since(last).as_secs_f64());
+        glide.last.set(Some(at));
+        let running = {
+            let mut shared = glide.shared.borrow_mut();
+            let running = shared.scroll.step(dt.max(0.001));
+            glide.handle.update_signals(&mut shared);
+            running
+        };
+        glide.handle.ctx.element.repaint();
+        // A finished glide stops by not registering again. The handle this replaces or drops has
+        // already run, and cancelling a spent registration does nothing.
+        *glide.slot.borrow_mut() = if running { arm(glide) } else { None };
+    }
+
+    let glide: Rc<RefCell<Option<zgui::view::time::FrameHandle>>> = Rc::new(RefCell::new(None));
+    let glide_last: Rc<Cell<Option<zgui::view::Timestamp>>> = Rc::new(Cell::new(None));
     let start_glide: Box<dyn Fn()> = {
-        let shared = Rc::clone(&shared);
-        let handle = handle.clone();
-        let glide = Rc::clone(&glide);
-        let glide_stop = Rc::clone(&glide_stop);
-        let glide_last = Rc::clone(&glide_last);
+        let glide = Glide {
+            shared: Rc::clone(&shared),
+            handle: handle.clone(),
+            slot: Rc::clone(&glide),
+            last: Rc::clone(&glide_last),
+            clock: clock.clone(),
+        };
         Box::new(move || {
-            if glide.borrow().is_some() {
+            if glide.slot.borrow().is_some() {
                 return;
             }
-            glide_last.set(Instant::now());
-            let tick = {
-                let shared = Rc::clone(&shared);
-                let handle = handle.clone();
-                let glide = Rc::clone(&glide);
-                let glide_stop = Rc::clone(&glide_stop);
-                let glide_last = Rc::clone(&glide_last);
-                move || {
-                    let now = Instant::now();
-                    let dt = now.duration_since(glide_last.get()).as_secs_f64();
-                    glide_last.set(now);
-                    let running = {
-                        let mut shared = shared.borrow_mut();
-                        let running = shared.scroll.step(dt.max(0.001));
-                        handle.update_signals(&mut shared);
-                        running
-                    };
-                    handle.ctx.element.repaint();
-                    if !running {
-                        // The interval may not be dropped from inside its own callback, so a
-                        // zero timeout does it at the start of the next frame.
-                        let glide = Rc::clone(&glide);
-                        *glide_stop.borrow_mut() = Some(set_timeout(Duration::ZERO, move || {
-                            glide.borrow_mut().take();
-                        }));
-                    }
-                }
-            };
-            *glide.borrow_mut() = Some(set_interval(GLIDE_TICK, tick));
+            // The first step has no previous frame moment; it takes the floor and starts
+            // measuring from the frame that runs it.
+            glide.last.set(None);
+            *glide.slot.borrow_mut() = arm(&glide);
         })
     };
     *handle.ctx.start_glide.borrow_mut() = Some(start_glide);
@@ -473,6 +510,7 @@ pub fn Editor(
         let drag_selection = Rc::clone(&drag_selection);
         let autoscroll = Rc::clone(&autoscroll);
         let autoscroll_last = Rc::clone(&autoscroll_last);
+        let clock = clock.clone();
         move |cx: &mut EventCx<'_, events::PointerMove>| {
             let Some((x, y)) = local_point(cx.position) else {
                 return;
@@ -566,8 +604,9 @@ pub fn Editor(
                                 });
                             }
                         };
-                        *autoscroll.borrow_mut() =
-                            Some(set_interval(Duration::from_millis(30), tick));
+                        *autoscroll.borrow_mut() = clock
+                            .as_ref()
+                            .map(|clock| clock.set_interval(Duration::from_millis(30), tick));
                     } else if !outside {
                         autoscroll.borrow_mut().take();
                     }
@@ -673,6 +712,7 @@ pub fn Editor(
         let handle = handle.clone();
         let blink = Rc::clone(&blink);
         let blinking = config.blink;
+        let clock = clock.clone();
         move |_: &mut EventCx<'_, events::FocusIn>| {
             {
                 let mut shared = shared.borrow_mut();
@@ -683,12 +723,14 @@ pub fn Editor(
             if blinking && blink.borrow().is_none() {
                 let shared = Rc::clone(&shared);
                 let element = handle.ctx.element.clone();
-                *blink.borrow_mut() = Some(set_interval(BLINK_INTERVAL, move || {
-                    let mut shared = shared.borrow_mut();
-                    shared.blink_on = !shared.blink_on;
-                    drop(shared);
-                    element.repaint();
-                }));
+                *blink.borrow_mut() = clock.as_ref().map(|clock| {
+                    clock.set_interval(BLINK_INTERVAL, move || {
+                        let mut shared = shared.borrow_mut();
+                        shared.blink_on = !shared.blink_on;
+                        drop(shared);
+                        element.repaint();
+                    })
+                });
             }
             if let Some(tell) = handle.ctx.on_event.borrow().as_ref() {
                 tell(EditorEvent::Focused);
@@ -714,8 +756,8 @@ pub fn Editor(
     };
 
     // The editor takes the keys as soon as it is there, when asked to.
-    if autofocus {
-        let claim = set_timeout(Duration::ZERO, move || port.focus());
+    if autofocus && let Some(clock) = clock.as_ref() {
+        let claim = clock.set_timeout(Duration::ZERO, move || port.focus());
         on_cleanup_local(move || drop(claim));
     }
 

@@ -26,6 +26,7 @@ use crate::core::position;
 use crate::core::selection::Selections;
 use crate::decoration::{Decoration, DecorationKind, GutterMark, Layers, Paint, UnderlineStyle};
 use crate::document::Document;
+use crate::overlay::Overlay;
 use crate::render::line_cache::{self, CachedLine, LineCache};
 use crate::render::metrics::TextMetrics;
 use crate::render::shaping::ShapingCache;
@@ -58,6 +59,8 @@ pub struct EditorShared {
     pub document: Document,
     /// This view's selections.
     pub selections: Selections,
+    /// The bands and the carets the application paints itself, when it does.
+    pub overlay: Overlay,
     /// The behaviour.
     pub config: EditorConfig,
     /// Where the view sits.
@@ -96,6 +99,14 @@ pub struct EditorShared {
     pub viewport: (f32, f32),
     /// Whether the editor has focus.
     pub focused: bool,
+    /// Whether this is the view a person is working in.
+    ///
+    /// Separate from `focused`, which is where the keyboard is right now. An editor under a picker
+    /// or a command line keeps its caret band, because it is still the view being worked in. An
+    /// application with several views on screen tells each one through
+    /// [`EditorHandle::set_active`](crate::EditorHandle::set_active); one with a single view leaves
+    /// it alone.
+    pub active: bool,
     /// Whether the caret is in the visible half of its blink.
     pub blink_on: bool,
     /// The widest shaped line seen so far, in device pixels.
@@ -115,6 +126,7 @@ impl EditorShared {
         Self {
             document,
             selections: Selections::caret(0),
+            overlay: Overlay::default(),
             config,
             scroll: ScrollState::default(),
             metrics: TextMetrics::default(),
@@ -132,6 +144,7 @@ impl EditorShared {
             requested_window: 0..0,
             viewport: (0.0, 0.0),
             focused: false,
+            active: true,
             blink_on: true,
             max_line_width: 0.0,
             max_line_chars: None,
@@ -208,6 +221,29 @@ impl EditorShared {
 
     // ---- Geometry ----------------------------------------------------------------------
 
+    /// Which lines this view draws, when it draws only some of them.
+    ///
+    /// Clamped to the text, so a window over lines a shrunken document no longer has is a window
+    /// over what is left of them. An empty one is no window at all.
+    pub fn line_window(&self) -> Option<Range<usize>> {
+        let total = self.line_count();
+        let window = self.config.line_window.clone()?;
+        let start = window.start.min(total);
+        let end = window.end.min(total);
+        (start < end).then_some(start..end)
+    }
+
+    /// The line at the top of what is drawn.
+    ///
+    /// A windowed view is pinned to its first line: there is nothing above it to scroll to, so
+    /// everything drawn is measured from there rather than from a scroll position nothing moves.
+    pub fn top_line(&self) -> f64 {
+        match self.line_window() {
+            Some(window) => window.start as f64,
+            None => self.scroll.pos.line,
+        }
+    }
+
     /// How many whole lines the viewport shows.
     pub fn viewport_lines(&self) -> f64 {
         (f64::from(self.viewport.1) / f64::from(self.metrics.line_height)).max(1.0)
@@ -229,7 +265,11 @@ impl EditorShared {
     pub fn scrollbar(&self) -> Scrollbar {
         Scrollbar {
             track: f64::from(self.viewport.1),
-            total: self.line_count(),
+            // A windowed view is exactly as tall as what it draws, so its bar has no thumb and
+            // every scroll gesture that asks the bar about one is answered with nothing.
+            total: self
+                .line_window()
+                .map_or_else(|| self.line_count(), |window| window.len()),
             viewport: self.viewport_lines(),
         }
     }
@@ -258,7 +298,7 @@ impl EditorShared {
     pub fn over_scrollbar(&self, x: f32, y: f32) -> bool {
         let bar = self.scrollbar_width();
         let vertical =
-            x >= self.viewport.0 - bar && self.scrollbar().thumb(self.scroll.pos.line).is_some();
+            x >= self.viewport.0 - bar && self.scrollbar().thumb(self.top_line()).is_some();
         let horizontal = y >= self.viewport.1 - bar && self.horizontal_thumb().is_some();
         vertical || horizontal
     }
@@ -288,11 +328,16 @@ impl EditorShared {
 
     /// The top of `line`, in device pixels from the content box's top.
     pub fn line_y(&self, line: usize) -> f32 {
-        ((line as f64 - self.scroll.pos.line) * f64::from(self.metrics.line_height)) as f32
+        ((line as f64 - self.top_line()) * f64::from(self.metrics.line_height)) as f32
     }
 
     /// The lines any part of which is on screen.
     pub fn visible_lines(&self) -> Range<usize> {
+        // A window is the answer on its own: it says which lines are drawn, and a box a line
+        // taller than them must not draw the line after.
+        if let Some(window) = self.line_window() {
+            return window;
+        }
         let total = self.line_count();
         let first = self.scroll.pos.line.floor().max(0.0) as usize;
         let rows =
@@ -508,6 +553,29 @@ impl EditorShared {
         Some((x0, x1))
     }
 
+    /// How many graphemes `line` holds.
+    fn column_count(&self, line: usize) -> u32 {
+        let rope = self.rope();
+        position::grapheme_col(&rope, position::line_end(&rope, line)) as u32
+    }
+
+    /// Where the left edge of `column` on `line` sits, in x offsets inside the text area.
+    ///
+    /// A column past the end of the line carries on in whole cells, which is what lets a block
+    /// selection and its caret reach past the text.
+    pub fn cell_x(&mut self, line: usize, column: u32) -> f32 {
+        let cell = self.metrics.cell_advance;
+        let columns = self.column_count(line);
+        let rope = self.rope();
+        let start = position::line_start(&rope, line);
+        let byte = position::byte_at_col(&rope, line, column.min(columns) as usize);
+        let Some(cached) = self.ensure_line(line) else {
+            return column as f32 * cell;
+        };
+        let x = line_cache::caret_x(&cached.shaped, (byte - start) as u32);
+        x + column.saturating_sub(columns) as f32 * cell
+    }
+
     // ---- Lines -------------------------------------------------------------------------
 
     /// The painted form of `line`, rebuilt if any of its stamps went stale.
@@ -580,7 +648,7 @@ impl EditorShared {
     pub fn hit_test(&mut self, x: f32, y: f32) -> usize {
         let rope = self.rope();
         let total = position::line_count(&rope);
-        let line_f = self.scroll.pos.line + f64::from(y) / f64::from(self.metrics.line_height);
+        let line_f = self.top_line() + f64::from(y) / f64::from(self.metrics.line_height);
         let line = (line_f.max(0.0) as usize).min(total.saturating_sub(1));
         let start = position::line_start(&rope, line);
         let text_x = x - self.gutter_width() + self.scroll.pos.x_px as f32;
@@ -615,11 +683,16 @@ impl EditorShared {
         let text_x0 = gutter_w - self.scroll.pos.x_px as f32;
         let visible = self.visible_lines();
         let rope = self.rope();
-        let caret_lines: Vec<usize> = self
-            .selections
-            .iter()
-            .map(|selection| position::line_of(&rope, selection.head))
-            .collect();
+        // Which line the caret is on: the overlay's when it places the carets, and the line the
+        // selection's head is on otherwise.
+        let caret_lines: Vec<usize> = if self.overlay.carets.is_empty() {
+            self.selections
+                .iter()
+                .map(|selection| position::line_of(&rope, selection.head))
+                .collect()
+        } else {
+            self.overlay.carets.iter().map(|caret| caret.line).collect()
+        };
 
         // The gutter's own background.
         if let Some(color) = self.theme.gutter_bg
@@ -628,8 +701,8 @@ impl EditorShared {
             fill(painter, 0.0, 0.0, gutter_w, height, color);
         }
 
-        // The band behind each caret's line.
-        if let Some(color) = self.theme.current_line {
+        // The band behind each caret's line, in the view being worked in.
+        if let Some(color) = self.theme.current_line.filter(|_| self.active) {
             for line in &caret_lines {
                 if visible.contains(line) {
                     let y = self.line_y(*line);
@@ -657,8 +730,26 @@ impl EditorShared {
         };
         let selections: Vec<crate::core::selection::Selection> =
             self.selections.iter().copied().collect();
+        // The overlay's cells, when it has any. They say what the bytes cannot: a rectangle that
+        // keeps its width over a line ending inside it.
+        for band in self.overlay.bands.clone() {
+            if !visible.contains(&band.line) || band.columns.is_empty() {
+                continue;
+            }
+            let x0 = self.cell_x(band.line, band.columns.start);
+            let x1 = self.cell_x(band.line, band.columns.end);
+            let y = self.line_y(band.line);
+            fill(
+                painter,
+                text_x0 + x0,
+                y,
+                (x1 - x0).max(1.0),
+                metrics.line_height,
+                selection_color,
+            );
+        }
         for selection in &selections {
-            if selection.is_caret() {
+            if selection.is_caret() || !self.overlay.bands.is_empty() {
                 continue;
             }
             let range = selection.range();
@@ -750,7 +841,10 @@ impl EditorShared {
         self.paint_decoration_underlines(painter, &visible, text_x0);
 
         // The carets.
-        if self.focused || !selections.iter().all(|s| s.is_caret()) {
+        if self.focused
+            || !self.overlay.bands.is_empty()
+            || !selections.iter().all(|s| s.is_caret())
+        {
             self.paint_carets(painter, &rope, &visible, text_x0);
         }
 
@@ -762,7 +856,7 @@ impl EditorShared {
         {
             fill(painter, width - bar_width, 0.0, bar_width, height, track);
         }
-        if let Some((top, thumb_height)) = bar.thumb(self.scroll.pos.line) {
+        if let Some((top, thumb_height)) = bar.thumb(self.top_line()) {
             fill(
                 painter,
                 width - bar_width,
@@ -940,10 +1034,29 @@ impl EditorShared {
         if self.focused && self.config.blink && !self.blink_on {
             return;
         }
-        let selections: Vec<crate::core::selection::Selection> =
-            self.selections.iter().copied().collect();
-        for selection in &selections {
-            let head = selection.head;
+        // Each caret as the byte it sits on and how many whole cells past the end of its line it
+        // is. Only an overlay reaches past the end; a selection's head is always a byte.
+        let carets: Vec<(usize, u32)> = if self.overlay.carets.is_empty() {
+            self.selections
+                .iter()
+                .map(|selection| (selection.head, 0))
+                .collect()
+        } else {
+            let last = position::line_count(rope).saturating_sub(1);
+            self.overlay
+                .carets
+                .iter()
+                .map(|caret| {
+                    let line = caret.line.min(last);
+                    let columns = self.column_count(line);
+                    (
+                        position::byte_at_col(rope, line, caret.column.min(columns) as usize),
+                        caret.column.saturating_sub(columns),
+                    )
+                })
+                .collect()
+        };
+        for (head, past) in carets {
             let line = position::line_of(rope, head);
             if !visible.contains(&line) {
                 continue;
@@ -953,8 +1066,16 @@ impl EditorShared {
             let Some(cached) = self.ensure_line(line) else {
                 continue;
             };
-            let x = text_x0 + line_cache::caret_x(&cached.shaped, local);
+            let x = text_x0
+                + line_cache::caret_x(&cached.shaped, local)
+                + past as f32 * metrics.cell_advance;
             let y = self.line_y(line);
+            // Past the end of the line every cell is one cell wide; on it, the grapheme decides.
+            let width = if past > 0 {
+                metrics.cell_advance
+            } else {
+                self.grapheme_width(&cached, rope, line_start, head)
+            };
             match style {
                 CursorStyle::Bar => {
                     let width = (2.0 * metrics.scale).max(1.0);
@@ -962,7 +1083,6 @@ impl EditorShared {
                 }
                 CursorStyle::Underline => {
                     let height = (2.0 * metrics.scale).max(1.0);
-                    let width = self.grapheme_width(&cached, rope, line_start, head);
                     fill(
                         painter,
                         x,
@@ -973,7 +1093,6 @@ impl EditorShared {
                     );
                 }
                 CursorStyle::Block | CursorStyle::Hollow => {
-                    let width = self.grapheme_width(&cached, rope, line_start, head);
                     if style == CursorStyle::Hollow {
                         painter.stroke(
                             Rect::new(
@@ -986,6 +1105,10 @@ impl EditorShared {
                         );
                     } else {
                         fill(painter, x, y, width, metrics.line_height, self.theme.cursor);
+                        if past > 0 {
+                            // There is no character out here to redraw.
+                            continue;
+                        }
                         // The character under the block, redrawn in the cursor's text colour.
                         let expanded = cached.shaped.tab_map.to_expanded(local);
                         let origin = Point::new(
@@ -1141,8 +1264,69 @@ fn fill(painter: &mut ScenePainter<'_>, x: f32, y: f32, width: f32, height: f32,
 mod tests {
     use zgui::elements::kurbo::{PathEl, Shape as _};
 
-    use super::underline_stroke;
+    use super::{EditorShared, underline_stroke};
+    use crate::config::EditorConfig;
     use crate::decoration::UnderlineStyle;
+    use crate::document::Document;
+
+    /// A view over `text` drawing `window`, with a viewport tall enough for the whole text.
+    fn windowed(text: &str, window: Option<std::ops::Range<usize>>) -> EditorShared {
+        let config = EditorConfig {
+            line_window: window,
+            ..EditorConfig::default()
+        };
+        let mut shared = EditorShared::new(Document::new(text), config, None);
+        shared.viewport = (400.0, 20.0 * 20.0);
+        shared
+    }
+
+    #[test]
+    fn a_view_with_no_window_draws_from_where_it_is_scrolled() {
+        let mut shared = windowed("a\nb\nc\nd\ne\n", None);
+        shared.scroll.pos.line = 2.0;
+        assert_eq!(shared.top_line(), 2.0);
+        assert_eq!(shared.visible_lines().start, 2);
+        assert_eq!(shared.line_y(2), 0.0, "the top line sits at the top");
+    }
+
+    #[test]
+    fn a_window_is_the_lines_that_are_drawn() {
+        let shared = windowed("a\nb\nc\nd\ne\n", Some(1..3));
+        assert_eq!(shared.visible_lines(), 1..3);
+        assert_eq!(shared.line_y(1), 0.0, "the window's first line is the top");
+        assert_eq!(shared.line_y(2), shared.metrics.line_height);
+    }
+
+    #[test]
+    fn a_window_does_not_scroll() {
+        // Nothing above the first line to scroll to, so a scroll position that moved under it
+        // must change nothing about what is drawn.
+        let mut shared = windowed("a\nb\nc\nd\ne\n", Some(1..3));
+        shared.scroll.pos.line = 4.0;
+        assert_eq!(shared.top_line(), 1.0);
+        assert_eq!(shared.visible_lines(), 1..3);
+        assert!(
+            shared.scrollbar().thumb(shared.top_line()).is_none(),
+            "a view as tall as what it draws has no thumb"
+        );
+    }
+
+    #[test]
+    fn a_window_over_lines_that_have_gone_is_what_is_left_of_them() {
+        // A document edited down under a window must leave a window over real lines, and never a
+        // range that reads past the end of the rope.
+        let shared = windowed("a\nb\n", Some(1..9));
+        assert_eq!(shared.line_window(), Some(1..3));
+        assert_eq!(shared.visible_lines(), 1..3);
+    }
+
+    #[test]
+    fn a_window_over_nothing_is_no_window() {
+        let shared = windowed("a\nb\nc\n", Some(2..2));
+        assert_eq!(shared.line_window(), None);
+        let past = windowed("a\nb\nc\n", Some(9..12));
+        assert_eq!(past.line_window(), None);
+    }
 
     #[test]
     fn a_squiggle_waves_inside_the_room_it_was_given() {

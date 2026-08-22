@@ -26,6 +26,7 @@ rustc-hash = "2"
 smallvec = "1"
 compact_str = "0.10"
 flume = { version = "0.12", default-features = false, features = ["async"] }
+serde = { version = "1", features = ["derive"], optional = true }
 
 tree-sitter-rust = { version = "0.24", optional = true }
 tree-sitter-toml-ng = { version = "0.7", optional = true }
@@ -33,6 +34,8 @@ tree-sitter-md = { version = "0.5", optional = true }
 
 [features]
 default = []
+# Writing a document's text and its undo history down, which is what a session needs.
+serde = ["dep:serde", "smallvec/serde"]
 # Bundled grammars, one feature per language so an application ships only what it uses.
 lang-rust = ["dep:tree-sitter-rust"]
 lang-toml = ["dep:tree-sitter-toml-ng"]
@@ -44,6 +47,7 @@ zgui-testkit-view = { git = "https://github.com/zortax/zgui" }
 zgui-testkit-scene = { git = "https://github.com/zortax/zgui" }
 zgui-platform-headless = { git = "https://github.com/zortax/zgui" }
 zgui-layout = { git = "https://github.com/zortax/zgui" }
+serde_json = "1"
 
 [[example]]
 name = "basic"
