@@ -184,46 +184,7 @@ impl Worker {
         if start_line >= end_line {
             return Ok(());
         }
-        let start_byte = self.rope.line_to_byte(start_line);
-        let end_byte = if end_line >= total {
-            self.rope.len_bytes()
-        } else {
-            self.rope.line_to_byte(end_line)
-        };
-
-        let mut spans: Vec<SmallVec<[LineSpan; 8]>> = vec![SmallVec::new(); end_line - start_line];
-        let mut cursor = tree_sitter::QueryCursor::new();
-        cursor.set_byte_range(start_byte..end_byte);
-        let mut matches =
-            cursor.matches(query, tree.root_node(), RopeProvider { rope: &self.rope });
-        while let Some(matched) = matches.next() {
-            for capture in matched.captures {
-                let node = capture.node;
-                let from = node.start_position();
-                let to = node.end_position();
-                for row in from.row..=to.row {
-                    if row < start_line || row >= end_line {
-                        continue;
-                    }
-                    let col_start = if row == from.row {
-                        from.column as u32
-                    } else {
-                        0
-                    };
-                    let col_end = if row == to.row {
-                        to.column as u32
-                    } else {
-                        u32::MAX
-                    };
-                    if col_end > col_start {
-                        spans[row - start_line].push((col_start, col_end, capture.index as u16));
-                    }
-                }
-            }
-        }
-        for line in spans.iter_mut() {
-            line.sort_by_key(|(start, end, _)| (*start, *end));
-        }
+        let spans = collect_spans(tree, query, &self.rope, start_line..end_line);
 
         self.frames
             .send(FromWorker::Frame(HighlightFrame {
@@ -233,6 +194,64 @@ impl Worker {
             }))
             .map_err(|_| ())
     }
+}
+
+/// The spans of `lines`, queried over a parsed tree.
+///
+/// Spans are in line-local byte offsets, sorted by start and then end. A node that covers
+/// several lines emits one span per line; the interior lines run to `u32::MAX`.
+pub(crate) fn collect_spans(
+    tree: &tree_sitter::Tree,
+    query: &tree_sitter::Query,
+    rope: &Rope,
+    lines: std::ops::Range<usize>,
+) -> Vec<SmallVec<[LineSpan; 8]>> {
+    let total = rope.len_lines();
+    let start_line = lines.start;
+    let end_line = lines.end.min(total);
+    if start_line >= end_line {
+        return Vec::new();
+    }
+    let start_byte = rope.line_to_byte(start_line);
+    let end_byte = if end_line >= total {
+        rope.len_bytes()
+    } else {
+        rope.line_to_byte(end_line)
+    };
+
+    let mut spans: Vec<SmallVec<[LineSpan; 8]>> = vec![SmallVec::new(); end_line - start_line];
+    let mut cursor = tree_sitter::QueryCursor::new();
+    cursor.set_byte_range(start_byte..end_byte);
+    let mut matches = cursor.matches(query, tree.root_node(), RopeProvider { rope });
+    while let Some(matched) = matches.next() {
+        for capture in matched.captures {
+            let node = capture.node;
+            let from = node.start_position();
+            let to = node.end_position();
+            for row in from.row..=to.row {
+                if row < start_line || row >= end_line {
+                    continue;
+                }
+                let col_start = if row == from.row {
+                    from.column as u32
+                } else {
+                    0
+                };
+                let col_end = if row == to.row {
+                    to.column as u32
+                } else {
+                    u32::MAX
+                };
+                if col_end > col_start {
+                    spans[row - start_line].push((col_start, col_end, capture.index as u16));
+                }
+            }
+        }
+    }
+    for line in spans.iter_mut() {
+        line.sort_by_key(|(start, end, _)| (*start, *end));
+    }
+    spans
 }
 
 /// Hands tree-sitter the text of a node, straight out of the rope's chunks.

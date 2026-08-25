@@ -83,5 +83,6 @@ pub use crate::document::Document;
 pub use crate::event::{EditorEvent, KeyFilter};
 pub use crate::handle::{CaretRect, CursorPos, EditorHandle, EditorSnapshot, ScrollSnapshot};
 pub use crate::overlay::{Band, Caret, Overlay};
+pub use crate::syntax::oneshot::{Highlighted, highlight};
 pub use crate::syntax::registry::{LanguageConfig, LanguageRegistry};
 pub use crate::view::{Editor, EditorProps};

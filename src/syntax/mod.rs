@@ -5,6 +5,7 @@
 //! converges on the newest text — so a line is only ever coloured by spans that describe it.
 
 pub mod languages;
+pub mod oneshot;
 pub mod registry;
 pub mod spans;
 pub mod worker;
