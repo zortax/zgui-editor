@@ -148,15 +148,7 @@ fn a_decoration_layer_paints_and_clears() {
     // A settled window replays rather than re-encoding, so every measurement has to follow
     // something that made the element paint again.
     let quads = |harness: &mut Harness<Runtime>, handle: &EditorHandle| {
-        handle.command(zgui_editor::Command::Scroll(
-            zgui_editor::ScrollCmd::EnsureCursorVisible,
-        ));
-        harness.settle(8);
-        harness.app_mut().windows_mut()[0]
-            .scene()
-            .primitives
-            .quads
-            .len()
+        quads_after(harness, handle).len()
     };
     let bare = quads(&mut harness, &handle);
 
@@ -187,15 +179,7 @@ fn a_straight_underline_reaches_the_display_list() {
     // has no rasteriser for; their geometry is asserted where it is built instead.
     let (mut harness, handle) = mounted("fn main() {}\n");
     let quads = |harness: &mut Harness<Runtime>, handle: &EditorHandle| {
-        handle.command(zgui_editor::Command::Scroll(
-            zgui_editor::ScrollCmd::EnsureCursorVisible,
-        ));
-        harness.settle(8);
-        harness.app_mut().windows_mut()[0]
-            .scene()
-            .primitives
-            .quads
-            .len()
+        quads_after(harness, handle).len()
     };
     let bare = quads(&mut harness, &handle);
 
@@ -383,4 +367,110 @@ fn a_wheel_glide_steps_every_frame_and_parks_at_its_target() {
         !harness.app().windows()[0].is_animating(),
         "a finished glide leaves nothing pending"
     );
+}
+
+/// The quads of the frame after `handle` was made to paint again.
+///
+/// Whatever the change owed is settled first — a relayout is a frame of its own — and then one
+/// repaint is asked for and exactly one frame run, so the scene read is the frame that drew the
+/// element rather than a quiet one after it.
+fn quads_after(harness: &mut Harness<Runtime>, handle: &EditorHandle) -> Vec<[f32; 4]> {
+    handle.command(zgui_editor::Command::Scroll(
+        zgui_editor::ScrollCmd::EnsureCursorVisible,
+    ));
+    harness.settle(8);
+    handle.set_cursor_style(zgui_editor::CursorStyle::Bar);
+    harness.advance(std::time::Duration::from_millis(16));
+    harness.pump();
+    harness.app_mut().windows_mut()[0]
+        .scene()
+        .primitives
+        .quads
+        .iter()
+        .map(|quad| quad.bounds)
+        .collect()
+}
+
+#[test]
+fn a_line_background_spans_the_text_area_and_a_bar_hugs_the_edge() {
+    let (mut harness, handle) = mounted("one\ntwo\nthree\nfour\n");
+    let bare = quads_after(&mut harness, &handle);
+
+    // The second line, as bytes.
+    handle.set_decorations(
+        "kinds",
+        vec![
+            zgui_editor::Decoration::line_background(4..8, "editor-search"),
+            zgui_editor::Decoration::line_bar(4..8, "editor-search"),
+        ],
+    );
+    let decorated = quads_after(&mut harness, &handle);
+    let fresh: Vec<[f32; 4]> = decorated
+        .iter()
+        .filter(|quad| !bare.contains(quad))
+        .copied()
+        .collect();
+    assert_eq!(fresh.len(), 2, "one band and one bar: {fresh:?}");
+
+    let bar = fresh
+        .iter()
+        .find(|quad| quad[2] <= 2.0)
+        .expect("the bar is two pixels wide");
+    let band = fresh
+        .iter()
+        .find(|quad| quad[2] > 2.0)
+        .expect("the band is wider than the bar");
+    assert_eq!(bar[1], band[1], "both sit on the same line");
+    assert!(band[2] > 400.0, "the band reaches the far edge: {band:?}");
+    assert!(
+        band[0] > bar[0],
+        "the band starts past the gutter, the bar at the edge"
+    );
+}
+
+#[test]
+fn a_custom_gutter_is_as_wide_as_declared_and_asks_the_source_for_every_visible_line() {
+    // The shipped fonts shape nothing, so the label's glyphs cannot be counted here; what can be
+    // is the gutter the labels are drawn in, and that the source was asked.
+    let (mut harness, handle) = mounted("one\ntwo\n");
+    handle.set_decorations(
+        "kinds",
+        vec![zgui_editor::Decoration::line_background(
+            0..3,
+            "editor-search",
+        )],
+    );
+    let narrow = quads_after(&mut harness, &handle);
+    let band_x = |quads: &[[f32; 4]]| {
+        quads
+            .iter()
+            .find(|quad| quad[1] == 0.0 && quad[3] > 0.0 && quad[2] > 100.0 && quad[0] > 0.0)
+            .map(|quad| quad[0])
+            .expect("the band")
+    };
+    let before = band_x(&narrow);
+
+    let asked = Rc::new(RefCell::new(Vec::new()));
+    let seen = Rc::clone(&asked);
+    handle.set_gutter(zgui_editor::GutterMode::Custom { cells: 12 });
+    handle.set_gutter_source(Some(zgui_editor::GutterSource {
+        paints: vec![zgui_editor::Paint::from("editor-search")],
+        label: Rc::new(move |line| {
+            seen.borrow_mut().push(line);
+            Some(zgui_editor::GutterLabel {
+                text: "12 34".into(),
+                paint: Some("editor-search".into()),
+            })
+        }),
+    }));
+    let wide = quads_after(&mut harness, &handle);
+    assert!(
+        band_x(&wide) > before,
+        "twelve cells is wider than three digits: {before} then {}",
+        band_x(&wide)
+    );
+    let mut lines = asked.borrow().clone();
+    lines.sort_unstable();
+    lines.dedup();
+    assert_eq!(lines, [0, 1, 2], "every visible line was asked for");
 }

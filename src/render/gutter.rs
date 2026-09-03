@@ -7,11 +7,12 @@ const PADDING_CELLS: f32 = 2.0;
 
 /// How wide the gutter is, in device pixels.
 pub fn width(mode: GutterMode, line_count: usize, cell_advance: f32) -> f32 {
-    if mode == GutterMode::None {
-        return 0.0;
-    }
-    let digits = digits(line_count).max(3) as f32;
-    ((digits + PADDING_CELLS) * cell_advance).ceil()
+    let cells = match mode {
+        GutterMode::None => return 0.0,
+        GutterMode::Custom { cells } => f32::from(cells),
+        GutterMode::Absolute | GutterMode::Relative => digits(line_count).max(3) as f32,
+    };
+    ((cells + PADDING_CELLS) * cell_advance).ceil()
 }
 
 /// The label line `line` shows, when the gutter shows one.
@@ -20,7 +21,7 @@ pub fn width(mode: GutterMode, line_count: usize, cell_advance: f32) -> f32 {
 /// own number — the arrangement vim calls `relativenumber` with `number`.
 pub fn label(mode: GutterMode, line: usize, caret_line: usize) -> Option<String> {
     match mode {
-        GutterMode::None => None,
+        GutterMode::None | GutterMode::Custom { .. } => None,
         GutterMode::Absolute => Some((line + 1).to_string()),
         GutterMode::Relative if line == caret_line => Some((line + 1).to_string()),
         GutterMode::Relative => Some(line.abs_diff(caret_line).to_string()),

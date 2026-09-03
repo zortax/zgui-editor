@@ -121,3 +121,27 @@ impl SyntaxState {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_spans_resolve_through_the_capture_vocabulary() {
+        let mut state = SyntaxState::default();
+        let theme = Theme::fallback();
+        state.set_captures(vec!["keyword".into(), "string".into()], &theme);
+        let before = state.version();
+        state.put_line(
+            3,
+            SmallVec::from_vec(vec![(0, 2, 0), (4, 9, 1), (10, 11, 7)]),
+        );
+        state.bump();
+        assert!(state.version() > before, "a stored batch moves the version");
+        let coloured = state.colored_spans(3);
+        // The capture outside the vocabulary colours nothing; the rest take the theme's answer.
+        assert_eq!(coloured.len(), 2);
+        assert_eq!((coloured[0].0, coloured[0].1), (0, 2));
+        assert!(state.colored_spans(4).is_empty());
+    }
+}

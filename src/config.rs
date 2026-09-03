@@ -15,6 +15,12 @@ pub enum GutterMode {
     Relative,
     /// No gutter at all.
     None,
+    /// Every line shows what the application's gutter source says, in a gutter this many cells
+    /// wide plus the usual padding. See `EditorHandle::set_gutter_source`.
+    Custom {
+        /// How many character cells the labels need.
+        cells: u16,
+    },
 }
 
 /// What the caret looks like.
@@ -36,6 +42,11 @@ pub enum CursorStyle {
 pub struct EditorConfig {
     /// How lines are numbered.
     pub gutter: GutterMode,
+    /// Whether the view draws its own vertical scrollbar.
+    ///
+    /// Off for a view that scrolls in step with another one beside it, which shows the bar for
+    /// both. The wheel, the keys and every scroll command still work.
+    pub scrollbar: bool,
     /// What the caret looks like.
     pub cursor_style: CursorStyle,
     /// Whether the caret blinks.
@@ -74,6 +85,7 @@ impl Default for EditorConfig {
     fn default() -> Self {
         Self {
             gutter: GutterMode::default(),
+            scrollbar: true,
             cursor_style: CursorStyle::default(),
             blink: true,
             smooth_scroll: true,

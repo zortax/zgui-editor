@@ -16,6 +16,10 @@ struct Mounted {
 }
 
 fn mount(text: &str, on_key: Option<zgui_editor::KeyFilter>) -> Mounted {
+    mount_with(text, on_key, true)
+}
+
+fn mount_with(text: &str, on_key: Option<zgui_editor::KeyFilter>, focusable: bool) -> Mounted {
     let window = Window::open();
     window.place(window.root, 0.0, 0.0, 800.0, 600.0);
     let taken: Rc<RefCell<Option<EditorHandle>>> = Rc::new(RefCell::new(None));
@@ -31,6 +35,7 @@ fn mount(text: &str, on_key: Option<zgui_editor::KeyFilter>) -> Mounted {
                         *taken.borrow_mut() = Some(handle);
                     }) as Box<dyn Fn(EditorHandle)>,
                     on_key = on_key,
+                    focusable = focusable,
                 )
             };
             use zgui::view::IntoView;
@@ -120,6 +125,17 @@ fn ctrl_z_undoes_typing() {
     type_str(&mounted, "abc");
     press_with(&mounted, Key::character("z"), Modifiers::CONTROL);
     assert_eq!(text_of(&mounted), "", "one burst of typing undoes as one");
+}
+
+#[test]
+fn an_editor_that_cannot_take_focus_leaves_every_key_alone() {
+    let mounted = mount_with("", None, false);
+    type_str(&mounted, "x");
+    assert_eq!(text_of(&mounted), "", "the default keymap never ran");
+    // A command still drives it: the keys are what it declines, not the handle.
+    mounted.handle.command(Command::Insert("y".to_string()));
+    mounted.window.frame();
+    assert_eq!(text_of(&mounted), "y");
 }
 
 #[test]

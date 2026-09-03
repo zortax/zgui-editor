@@ -78,7 +78,9 @@ pub use crate::core::history::{History, Step};
 pub use crate::core::search::SearchDirection;
 pub use crate::core::selection::{Selection, Selections};
 pub use crate::core::{DocumentState, EditOptions, EditorState};
-pub use crate::decoration::{Decoration, DecorationKind, GutterMark, Paint, UnderlineStyle};
+pub use crate::decoration::{
+    Decoration, DecorationKind, GutterLabel, GutterMark, GutterSource, Mark, Paint, UnderlineStyle,
+};
 pub use crate::document::Document;
 pub use crate::event::{EditorEvent, KeyFilter};
 pub use crate::handle::{CaretRect, CursorPos, EditorHandle, EditorSnapshot, ScrollSnapshot};

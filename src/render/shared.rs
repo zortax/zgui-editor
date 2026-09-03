@@ -24,7 +24,9 @@ use crate::config::{CursorStyle, EditorConfig, GutterMode};
 use crate::core::motion::MotionContext;
 use crate::core::position;
 use crate::core::selection::Selections;
-use crate::decoration::{Decoration, DecorationKind, GutterMark, Layers, Paint, UnderlineStyle};
+use crate::decoration::{
+    Decoration, DecorationKind, GutterMark, GutterSource, Layers, Paint, UnderlineStyle,
+};
 use crate::document::Document;
 use crate::overlay::Overlay;
 use crate::render::line_cache::{self, CachedLine, LineCache};
@@ -85,6 +87,8 @@ pub struct EditorShared {
     pub decorations: Layers<Decoration>,
     /// Marks the application drew in the gutter.
     pub gutter_marks: Layers<GutterMark>,
+    /// What a custom gutter's labels are, when the application draws the gutter.
+    pub gutter_source: Option<GutterSource>,
     /// The colours those marks named, as the style sheet answers for them.
     ///
     /// A name present with `None` is one the sheet does not set, which is different from one that
@@ -139,6 +143,7 @@ impl EditorShared {
             syntax: SyntaxState::default(),
             decorations: Layers::default(),
             gutter_marks: Layers::default(),
+            gutter_source: None,
             decoration_colors: rustc_hash::FxHashMap::default(),
             syntax_tx: None,
             requested_window: 0..0,
@@ -211,11 +216,19 @@ impl EditorShared {
 
         if let Some(tx) = self.syntax_tx.as_ref() {
             let (snapshot, revision) = self.document.state().snapshot();
-            let _ = tx.send(crate::syntax::worker::ToWorker::Edited {
-                input_edits: change.input_edits.clone(),
-                snapshot,
-                revision,
-            });
+            // A replaced text carries no edits. Sent as an edit, the worker would parse it
+            // against the old text's tree, and a grammar's scanner would be handed states from
+            // text that is gone.
+            let message = if change.whole_text {
+                crate::syntax::worker::ToWorker::Replaced { snapshot, revision }
+            } else {
+                crate::syntax::worker::ToWorker::Edited {
+                    input_edits: change.input_edits.clone(),
+                    snapshot,
+                    revision,
+                }
+            };
+            let _ = tx.send(message);
         }
     }
 
@@ -256,8 +269,11 @@ impl EditorShared {
         }
     }
 
-    /// How wide the scrollbar is, in device pixels.
+    /// How wide the scrollbar is, in device pixels: nothing when the view draws none.
     pub fn scrollbar_width(&self) -> f32 {
+        if !self.config.scrollbar {
+            return 0.0;
+        }
         SCROLLBAR_WIDTH * self.metrics.scale.max(0.5)
     }
 
@@ -470,19 +486,7 @@ impl EditorShared {
     /// whatever is in the layers right now. The names are collected first because resolving
     /// writes into the map the layers would otherwise be borrowed beside.
     fn resolve_decoration_colors(&mut self, style: &ComputedStyle) {
-        let names: Vec<String> = self
-            .decorations
-            .iter()
-            .map(|decoration| match &decoration.kind {
-                DecorationKind::Background(paint) => paint,
-                DecorationKind::Underline { paint, .. } => paint,
-            })
-            .chain(self.gutter_marks.iter().map(|mark| &mark.paint))
-            .filter_map(|paint| match paint {
-                Paint::Property(name) => Some(name.as_ref().to_owned()),
-                Paint::Color(_) => None,
-            })
-            .collect();
+        let names: Vec<String> = self.named_properties().map(str::to_owned).collect();
 
         self.decoration_colors.clear();
         for name in names {
@@ -491,22 +495,44 @@ impl EditorShared {
         }
     }
 
+    /// Every custom property a decoration, a gutter mark or the gutter source names.
+    fn named_properties(&self) -> impl Iterator<Item = &str> {
+        let source = self
+            .gutter_source
+            .iter()
+            .flat_map(|source| source.paints.iter())
+            .filter_map(|paint| match paint {
+                Paint::Property(name) => Some(name.as_ref()),
+                Paint::Color(_) => None,
+            });
+        self.decorations
+            .properties()
+            .chain(self.gutter_marks.properties())
+            .chain(source)
+    }
+
     /// Whether any decoration names a property that has not been looked up yet.
     ///
     /// True after a layer is set that mentions a colour the last layout never saw, which is the
     /// one case where drawing has to wait for the style to be read again.
     pub fn decorations_need_style(&self) -> bool {
-        self.decorations
-            .iter()
-            .map(|decoration| match &decoration.kind {
-                DecorationKind::Background(paint) => paint,
-                DecorationKind::Underline { paint, .. } => paint,
-            })
-            .chain(self.gutter_marks.iter().map(|mark| &mark.paint))
-            .any(|paint| match paint {
-                Paint::Property(name) => !self.decoration_colors.contains_key(name.as_ref()),
-                Paint::Color(_) => false,
-            })
+        self.named_properties()
+            .any(|name| !self.decoration_colors.contains_key(name))
+    }
+
+    /// The bytes of the lines in `visible`, which is what a decoration layer is asked over.
+    fn visible_bytes(&self, visible: &Range<usize>) -> Range<usize> {
+        let rope = self.rope();
+        if visible.is_empty() {
+            return 0..0;
+        }
+        let start = position::line_start(&rope, visible.start);
+        let end = if visible.end >= position::line_count(&rope) {
+            rope.len_bytes()
+        } else {
+            position::line_start(&rope, visible.end)
+        };
+        start..end.max(start)
     }
 
     /// What one decoration is drawn with.
@@ -788,18 +814,29 @@ impl EditorShared {
             }
         }
 
-        // The gutter's numbers.
+        // The gutter's numbers, or the application's labels in their place.
         if self.config.gutter != GutterMode::None {
             let caret_line = caret_lines.first().copied().unwrap_or(0);
             let number_right = gutter_w - metrics.cell_advance;
+            let source = self.gutter_source.clone();
             for line in visible.clone() {
-                let Some(label) = gutter::label(self.config.gutter, line, caret_line) else {
-                    continue;
-                };
-                let color = if line == caret_line {
+                let own = if line == caret_line {
                     self.theme.gutter_current_fg
                 } else {
                     self.theme.gutter_fg
+                };
+                let (label, color) = match (&source, self.config.gutter) {
+                    (Some(source), GutterMode::Custom { .. }) => match (source.label)(line) {
+                        Some(label) => {
+                            let color = label.paint.as_ref().map_or(own, |p| self.paint_color(p));
+                            (label.text, color)
+                        }
+                        None => continue,
+                    },
+                    _ => match gutter::label(self.config.gutter, line, caret_line) {
+                        Some(label) => (CompactString::from(label), own),
+                        None => continue,
+                    },
                 };
                 let Some(shaper) = self.shaper.as_mut() else {
                     break;
@@ -852,11 +889,14 @@ impl EditorShared {
         let bar = self.scrollbar();
         let bar_width = self.scrollbar_width();
         if let Some(track) = self.theme.scrollbar_track
+            && self.config.scrollbar
             && bar.thumb(0.0).is_some()
         {
             fill(painter, width - bar_width, 0.0, bar_width, height, track);
         }
-        if let Some((top, thumb_height)) = bar.thumb(self.top_line()) {
+        if self.config.scrollbar
+            && let Some((top, thumb_height)) = bar.thumb(self.top_line())
+        {
             fill(
                 painter,
                 width - bar_width,
@@ -907,19 +947,39 @@ impl EditorShared {
         }
         let rope = self.rope();
         let line_height = self.metrics.line_height;
+        let gutter_w = self.gutter_width();
+        let width = self.viewport.0;
+        let bar = (2.0 * self.metrics.scale).max(1.0);
+        let bytes = self.visible_bytes(visible);
         // Collected rather than iterated in place: drawing needs the shaped line, and shaping is
-        // a mutation of the same value the layers live in.
-        let bands: Vec<(Range<usize>, Color)> = self
-            .decorations
-            .iter()
-            .filter(|decoration| !decoration.range.is_empty())
-            .filter_map(|decoration| match &decoration.kind {
+        // a mutation of the same value the layers live in. The line-wide kinds are drawn here,
+        // under the byte bands, because they need no shaping at all.
+        let mut bands: Vec<(Range<usize>, Color)> = Vec::new();
+        for decoration in self.decorations.overlapping(bytes) {
+            if decoration.range.is_empty() {
+                continue;
+            }
+            match &decoration.kind {
                 DecorationKind::Background(paint) => {
-                    Some((decoration.range.clone(), self.paint_color(paint)))
+                    bands.push((decoration.range.clone(), self.paint_color(paint)));
                 }
-                DecorationKind::Underline { .. } => None,
-            })
-            .collect();
+                DecorationKind::LineBackground(paint) => {
+                    let color = self.paint_color(paint);
+                    for line in lines_touched(&rope, &decoration.range, visible) {
+                        let y = self.line_y(line);
+                        fill(painter, gutter_w, y, width - gutter_w, line_height, color);
+                    }
+                }
+                DecorationKind::LineBar(paint) => {
+                    let color = self.paint_color(paint);
+                    for line in lines_touched(&rope, &decoration.range, visible) {
+                        let y = self.line_y(line);
+                        fill(painter, 0.0, y, bar, line_height, color);
+                    }
+                }
+                DecorationKind::Underline { .. } => {}
+            }
+        }
 
         for (range, color) in bands {
             for line in lines_of(&rope, &range, visible) {
@@ -952,15 +1012,18 @@ impl EditorShared {
         let rope = self.rope();
         let scale = self.metrics.scale.max(0.5);
         let line_height = self.metrics.line_height;
+        let bytes = self.visible_bytes(visible);
         let underlines: Vec<(Range<usize>, UnderlineStyle, Color)> = self
             .decorations
-            .iter()
+            .overlapping(bytes)
             .filter(|decoration| !decoration.range.is_empty())
             .filter_map(|decoration| match &decoration.kind {
                 DecorationKind::Underline { style, paint } => {
                     Some((decoration.range.clone(), *style, self.paint_color(paint)))
                 }
-                DecorationKind::Background(_) => None,
+                DecorationKind::Background(_)
+                | DecorationKind::LineBackground(_)
+                | DecorationKind::LineBar(_) => None,
             })
             .collect();
 
@@ -996,8 +1059,7 @@ impl EditorShared {
         let metrics = self.metrics;
         let marks: Vec<(usize, CompactString, Color)> = self
             .gutter_marks
-            .iter()
-            .filter(|mark| visible.contains(&mark.line))
+            .overlapping(visible.clone())
             .map(|mark| (mark.line, mark.text.clone(), self.paint_color(&mark.paint)))
             .collect();
 
@@ -1156,6 +1218,17 @@ fn lines_of(rope: &ropey::Rope, range: &Range<usize>, visible: &Range<usize>) ->
     let from = position::line_of(rope, range.start).max(visible.start);
     let to =
         position::line_of(rope, range.end.min(rope.len_bytes())).min(visible.end.saturating_sub(1));
+    from..to.saturating_add(1).max(from)
+}
+
+/// The visible lines a half-open byte range holds any byte of.
+///
+/// Unlike [`lines_of`], a range that ends exactly where a line starts does not touch that line:
+/// a line-wide mark over one line must not spill onto the next.
+fn lines_touched(rope: &ropey::Rope, range: &Range<usize>, visible: &Range<usize>) -> Range<usize> {
+    let last = range.end.saturating_sub(1).max(range.start);
+    let from = position::line_of(rope, range.start).max(visible.start);
+    let to = position::line_of(rope, last.min(rope.len_bytes())).min(visible.end.saturating_sub(1));
     from..to.saturating_add(1).max(from)
 }
 

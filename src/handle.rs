@@ -20,7 +20,7 @@ use crate::core::motion::{self, MotionContext};
 use crate::core::search::SearchDirection;
 use crate::core::selection::{Selection, Selections};
 use crate::core::{ChangeInfo, EditorState, Response, ScrollEffect, position, search, words};
-use crate::decoration::{Decoration, GutterMark};
+use crate::decoration::{Decoration, GutterMark, GutterSource};
 use crate::document::{Document, ViewId};
 use crate::event::EditorEvent;
 use crate::overlay::Overlay;
@@ -471,6 +471,44 @@ impl EditorHandle {
     pub fn set_gutter(&self, mode: GutterMode) {
         self.ctx.shared.borrow_mut().config.gutter = mode;
         self.ctx.element.relayout();
+    }
+
+    /// Says where a [`GutterMode::Custom`] gutter's labels come from.
+    ///
+    /// The source's declared paints are resolved by the next layout, the same way a decoration's
+    /// are, so a label may be drawn in a colour the style sheet names.
+    pub fn set_gutter_source(&self, source: Option<GutterSource>) {
+        let needs_style = {
+            let mut shared = self.ctx.shared.borrow_mut();
+            shared.gutter_source = source;
+            shared.decorations_need_style()
+        };
+        self.after_marks(true, needs_style);
+    }
+
+    /// Colours the text from spans the application worked out itself.
+    ///
+    /// `captures` is the vocabulary the spans' capture indices count into, each name resolved to
+    /// its `--syntax-<name>` property by the theme. `lines` holds one entry per line, in
+    /// line-local byte offsets. For an editor with no language: the worker then says nothing, and
+    /// [`set_text`](Self::set_text) clears what is set here, so the text goes first.
+    pub fn set_highlights(
+        &self,
+        captures: Vec<String>,
+        lines: Vec<smallvec::SmallVec<[crate::syntax::LineSpan; 8]>>,
+    ) {
+        {
+            let mut shared = self.ctx.shared.borrow_mut();
+            let theme = shared.theme.clone();
+            shared.syntax.set_captures(captures, &theme);
+            for (line, spans) in lines.into_iter().enumerate() {
+                if !spans.is_empty() {
+                    shared.syntax.put_line(line, spans);
+                }
+            }
+            shared.syntax.bump();
+        }
+        self.ctx.element.repaint();
     }
 
     /// Says which lines the view draws, or that it draws all of them.

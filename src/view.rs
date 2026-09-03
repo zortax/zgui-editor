@@ -87,6 +87,13 @@ pub fn Editor(
     /// Whether the editor takes focus as soon as it is mounted.
     #[prop(default = true)]
     autofocus: bool,
+    /// Whether the editor can hold the keyboard at all.
+    ///
+    /// `false` makes a view that is read and pointed at while the keys stay with the element
+    /// around it: a click sets the caret and reports it, the wheel scrolls, and every key passes
+    /// by untouched.
+    #[prop(default = true)]
+    focusable: bool,
     /// Classes the caller put on the editor.
     #[prop(into, optional)]
     class: Classes,
@@ -272,6 +279,9 @@ pub fn Editor(
         let handle = handle.clone();
         let on_key = on_key;
         move |cx: &mut EventCx<'_, events::KeyDown>| {
+            if !focusable {
+                return;
+            }
             let event: zgui::vocab::KeyEvent = (*cx).clone();
             let modifiers = cx.modifiers;
             if let Some(filter) = on_key.as_ref()
@@ -374,14 +384,17 @@ pub fn Editor(
             let Some((x, y)) = local_point(cx.position) else {
                 return;
             };
-            cx.request_focus(cx.current);
-            port.focus();
+            if focusable {
+                cx.request_focus(cx.current);
+                port.focus();
+            }
 
             // The scrollbar, before the text: it sits on top of it.
             {
                 let mut shared = shared.borrow_mut();
                 let bar = shared.scrollbar();
-                if x >= shared.viewport.0 - shared.scrollbar_width()
+                if shared.config.scrollbar
+                    && x >= shared.viewport.0 - shared.scrollbar_width()
                     && let Some((top, height)) = bar.thumb(shared.scroll.pos.line)
                 {
                     let grab = if (f64::from(y) >= top) && (f64::from(y) < top + height) {
@@ -400,6 +413,9 @@ pub fn Editor(
                     over_scrollbar.set(true);
                     handle.ctx.element.repaint();
                     cx.capture_pointer();
+                    // The bar took the press. An ancestor that reads presses as presses on the
+                    // text would otherwise act on a drag of the thumb.
+                    cx.stop_propagation();
                     return;
                 }
             }
@@ -774,7 +790,7 @@ pub fn Editor(
             class = "editor",
             class = class,
             node_ref = port,
-            tabindex = Focus::Sequential,
+            tabindex = if focusable { Focus::Sequential } else { Focus::Programmatic },
             on:key_down = key_down,
             on:pointer_down = pointer_down,
             on:pointer_move = pointer_move,

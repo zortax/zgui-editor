@@ -5259,6 +5259,7 @@ dependencies = [
  "zgui-render-wgpu",
  "zgui-runtime",
  "zgui-scene",
+ "zgui-shader",
  "zgui-text",
  "zgui-text-parley",
  "zgui-view",
@@ -5665,6 +5666,7 @@ dependencies = [
  "zgui-profile",
  "zgui-render",
  "zgui-scene",
+ "zgui-wgsl",
 ]
 
 [[package]]
@@ -5730,6 +5732,31 @@ dependencies = [
  "zgui-geom",
  "zgui-layout",
  "zgui-vocab",
+]
+
+[[package]]
+name = "zgui-shader"
+version = "0.1.0"
+dependencies = [
+ "zgui-geom",
+ "zgui-paint",
+ "zgui-render-wgpu",
+ "zgui-scene",
+ "zgui-shader-macro",
+ "zgui-view",
+ "zgui-wgsl",
+]
+
+[[package]]
+name = "zgui-shader-macro"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "naga",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "zgui-wgsl",
 ]
 
 [[package]]
@@ -5908,6 +5935,13 @@ dependencies = [
  "zgui-scene",
  "zgui-view",
  "zgui-vocab",
+]
+
+[[package]]
+name = "zgui-wgsl"
+version = "0.1.0"
+dependencies = [
+ "zgui-scene",
 ]
 
 [[package]]

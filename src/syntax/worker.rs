@@ -35,6 +35,14 @@ pub enum ToWorker {
         /// Which revision the snapshot is.
         revision: u64,
     },
+    /// The whole text was replaced. The old tree describes none of it, so the next parse starts
+    /// from nothing.
+    Replaced {
+        /// The whole new text, as an O(1) snapshot.
+        snapshot: Rope,
+        /// Which revision the snapshot is.
+        revision: u64,
+    },
     /// The viewport moved; highlight these lines from now on.
     Window(std::ops::Range<usize>),
 }
@@ -140,6 +148,12 @@ impl Worker {
                         tree.edit(edit);
                     }
                 }
+                self.rope = snapshot;
+                self.revision = revision;
+                self.language.is_some()
+            }
+            ToWorker::Replaced { snapshot, revision } => {
+                self.tree = None;
                 self.rope = snapshot;
                 self.revision = revision;
                 self.language.is_some()
@@ -354,5 +368,47 @@ mod tests {
         let frames = drain_frames(&frames_rx);
         let frame = frames.last().expect("a frame after the edit");
         assert_eq!(frame.revision, 1, "the frame is stamped with the new text");
+    }
+
+    #[test]
+    fn a_replaced_text_is_parsed_from_nothing() {
+        let (frames_tx, frames_rx) = flume::unbounded();
+        let to_worker = spawn(frames_tx);
+        to_worker
+            .send(ToWorker::SetLanguage(
+                Some(rust_config()),
+                Rope::from_str("fn main() {\n    let x = 1;\n}\n"),
+                0,
+            ))
+            .unwrap();
+        to_worker.send(ToWorker::Window(0..4)).unwrap();
+        let comment = loop {
+            match frames_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(FromWorker::Captures(names)) => {
+                    break names.iter().position(|name| name == "comment").unwrap() as u16;
+                }
+                Ok(FromWorker::Frame(_)) => {}
+                Err(_) => panic!("the captures arrived"),
+            }
+        };
+        drain_frames(&frames_rx);
+
+        // A whole new text, with no edits that lead from the old one to it. The old tree says
+        // nothing about it, so the first line is a comment and nothing else.
+        to_worker
+            .send(ToWorker::Replaced {
+                snapshot: Rope::from_str("// only a comment\n"),
+                revision: 1,
+            })
+            .unwrap();
+        let frames = drain_frames(&frames_rx);
+        let frame = frames.last().expect("a frame after the replacement");
+        assert_eq!(frame.revision, 1);
+        let first: Vec<u16> = frame.spans[0].iter().map(|span| span.2).collect();
+        assert_eq!(
+            first,
+            vec![comment],
+            "the new text is highlighted, not the old one"
+        );
     }
 }
