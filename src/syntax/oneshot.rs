@@ -92,3 +92,36 @@ mod tests {
         assert!(answer.lines[0].is_empty());
     }
 }
+
+#[cfg(test)]
+#[cfg(feature = "lang-python")]
+mod python_tests {
+    use super::*;
+
+    fn python_config() -> LanguageConfig {
+        LanguageConfig {
+            name: "python".to_string(),
+            language: tree_sitter_python::LANGUAGE.into(),
+            highlight_query: tree_sitter_python::HIGHLIGHTS_QUERY.to_string(),
+            injections_query: None,
+            extensions: vec!["py".to_string()],
+        }
+    }
+
+    #[test]
+    fn the_python_query_compiles_and_colours_a_definition() {
+        let text = "def main():\n    print(\"hello\")\n";
+        let answer = highlight(&python_config(), text).expect("python highlights");
+        assert_eq!(answer.lines.len(), Rope::from_str(text).len_lines());
+
+        let named = |line: usize, prefix: &str| {
+            answer.lines[line]
+                .iter()
+                .any(|(_, _, capture)| answer.captures[*capture as usize].starts_with(prefix))
+        };
+        assert!(named(0, "keyword"), "`def` is a keyword");
+        assert!(named(0, "function"), "`main` is a function");
+        assert!(named(1, "function.builtin"), "`print` is a builtin");
+        assert!(named(1, "string"), "the literal is a string");
+    }
+}

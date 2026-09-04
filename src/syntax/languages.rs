@@ -28,4 +28,13 @@ pub(crate) fn register_bundled(registry: &crate::syntax::registry::LanguageRegis
         injections_query: Some(tree_sitter_md::INJECTION_QUERY_BLOCK.to_string()),
         extensions: vec!["md".to_string(), "markdown".to_string()],
     });
+
+    #[cfg(feature = "lang-python")]
+    registry.register(crate::syntax::registry::LanguageConfig {
+        name: "python".to_string(),
+        language: tree_sitter_python::LANGUAGE.into(),
+        highlight_query: tree_sitter_python::HIGHLIGHTS_QUERY.to_string(),
+        injections_query: None,
+        extensions: vec!["py".to_string(), "pyi".to_string()],
+    });
 }
