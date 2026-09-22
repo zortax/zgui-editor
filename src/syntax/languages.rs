@@ -37,4 +37,22 @@ pub(crate) fn register_bundled(registry: &crate::syntax::registry::LanguageRegis
         injections_query: None,
         extensions: vec!["py".to_string(), "pyi".to_string()],
     });
+
+    #[cfg(feature = "lang-yaml")]
+    registry.register(crate::syntax::registry::LanguageConfig {
+        name: "yaml".to_string(),
+        language: tree_sitter_yaml::LANGUAGE.into(),
+        highlight_query: tree_sitter_yaml::HIGHLIGHTS_QUERY.to_string(),
+        injections_query: None,
+        extensions: vec!["yaml".to_string(), "yml".to_string()],
+    });
+
+    #[cfg(feature = "lang-json")]
+    registry.register(crate::syntax::registry::LanguageConfig {
+        name: "json".to_string(),
+        language: tree_sitter_json::LANGUAGE.into(),
+        highlight_query: tree_sitter_json::HIGHLIGHTS_QUERY.to_string(),
+        injections_query: None,
+        extensions: vec!["json".to_string()],
+    });
 }

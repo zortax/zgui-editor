@@ -67,3 +67,28 @@ impl LanguageRegistry {
             .cloned()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(feature = "lang-yaml")]
+    fn yaml_claims_both_of_its_extensions() {
+        let registry = LanguageRegistry::new().with_bundled();
+        for extension in ["yaml", "yml"] {
+            let config = registry
+                .by_extension(extension)
+                .expect("a bundled language claims it");
+            assert_eq!(config.name, "yaml");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "lang-json")]
+    fn json_claims_its_extension() {
+        let registry = LanguageRegistry::new().with_bundled();
+        let config = registry.by_extension("json").expect("json is bundled");
+        assert_eq!(config.name, "json");
+    }
+}

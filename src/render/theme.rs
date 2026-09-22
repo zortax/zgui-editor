@@ -15,6 +15,7 @@ use zgui_css::ComputedStyle;
 /// back along its dots and then to the foreground.
 pub const SYNTAX_NAMES: &[&str] = &[
     "attribute",
+    "boolean",
     "comment",
     "comment-doc",
     "constant",
@@ -38,6 +39,7 @@ pub const SYNTAX_NAMES: &[&str] = &[
     "punctuation-special",
     "string",
     "string-special",
+    "string-special-key",
     "tag",
     "type",
     "type-builtin",

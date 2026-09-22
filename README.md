@@ -22,7 +22,8 @@ view! {
 - **Tree-sitter highlighting, incrementally.** A worker thread owns the parser and the tree;
   edits cross as `tree.edit` deltas, queries run only over the viewport (± overscan), and stale
   results are dropped by revision. Grammars are pluggable through `LanguageRegistry`; common
-  ones are bundled behind cargo features (`lang-rust`, `lang-toml`, `lang-markdown`, `lang-python`).
+  ones are bundled behind cargo features (`lang-rust`, `lang-toml`, `lang-markdown`, `lang-python`,
+  `lang-yaml`, `lang-json`).
 - **App-definable key handling.** An `on_key` filter hears every key before the editor does.
   The bundled vim example (`examples/vim`) implements modal editing — counts, operators,
   registers, `/` search — entirely outside the component, over the public `Command` vocabulary

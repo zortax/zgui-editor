@@ -147,9 +147,8 @@ fn a_decoration_layer_paints_and_clears() {
     let (mut harness, handle) = mounted("fn main() {\n    let greeting = \"hello\";\n}\n");
     // A settled window replays rather than re-encoding, so every measurement has to follow
     // something that made the element paint again.
-    let quads = |harness: &mut Harness<Runtime>, handle: &EditorHandle| {
-        quads_after(harness, handle).len()
-    };
+    let quads =
+        |harness: &mut Harness<Runtime>, handle: &EditorHandle| quads_after(harness, handle).len();
     let bare = quads(&mut harness, &handle);
 
     handle.set_decorations(
@@ -178,9 +177,8 @@ fn a_straight_underline_reaches_the_display_list() {
     // A straight underline is a quad. The waves and the dashes are strokes, which this harness
     // has no rasteriser for; their geometry is asserted where it is built instead.
     let (mut harness, handle) = mounted("fn main() {}\n");
-    let quads = |harness: &mut Harness<Runtime>, handle: &EditorHandle| {
-        quads_after(harness, handle).len()
-    };
+    let quads =
+        |harness: &mut Harness<Runtime>, handle: &EditorHandle| quads_after(harness, handle).len();
     let bare = quads(&mut harness, &handle);
 
     handle.set_decorations(

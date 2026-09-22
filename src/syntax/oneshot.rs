@@ -125,3 +125,70 @@ mod python_tests {
         assert!(named(1, "string"), "the literal is a string");
     }
 }
+
+#[cfg(test)]
+#[cfg(feature = "lang-yaml")]
+mod yaml_tests {
+    use super::*;
+
+    fn yaml_config() -> LanguageConfig {
+        LanguageConfig {
+            name: "yaml".to_string(),
+            language: tree_sitter_yaml::LANGUAGE.into(),
+            highlight_query: tree_sitter_yaml::HIGHLIGHTS_QUERY.to_string(),
+            injections_query: None,
+            extensions: vec!["yaml".to_string(), "yml".to_string()],
+        }
+    }
+
+    #[test]
+    fn the_yaml_query_compiles_and_colours_a_mapping() {
+        let text = "# a pod\nkind: Pod\nspec:\n  replicas: 3\n  paused: false\n";
+        let answer = highlight(&yaml_config(), text).expect("yaml highlights");
+        assert_eq!(answer.lines.len(), Rope::from_str(text).len_lines());
+
+        let named = |line: usize, prefix: &str| {
+            answer.lines[line]
+                .iter()
+                .any(|(_, _, capture)| answer.captures[*capture as usize].starts_with(prefix))
+        };
+        assert!(named(0, "comment"), "the first line is a comment");
+        assert!(named(1, "property"), "`kind` is a property");
+        assert!(named(1, "string"), "`Pod` is a string");
+        assert!(named(3, "number"), "`3` is a number");
+        assert!(named(4, "boolean"), "`false` is a boolean");
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "lang-json")]
+mod json_tests {
+    use super::*;
+
+    fn json_config() -> LanguageConfig {
+        LanguageConfig {
+            name: "json".to_string(),
+            language: tree_sitter_json::LANGUAGE.into(),
+            highlight_query: tree_sitter_json::HIGHLIGHTS_QUERY.to_string(),
+            injections_query: None,
+            extensions: vec!["json".to_string()],
+        }
+    }
+
+    #[test]
+    fn the_json_query_compiles_and_colours_an_object() {
+        let text = "{\n  \"kind\": \"Pod\",\n  \"replicas\": 3,\n  \"paused\": null\n}\n";
+        let answer = highlight(&json_config(), text).expect("json highlights");
+        assert_eq!(answer.lines.len(), Rope::from_str(text).len_lines());
+
+        let named = |line: usize, prefix: &str| {
+            answer.lines[line]
+                .iter()
+                .any(|(_, _, capture)| answer.captures[*capture as usize].starts_with(prefix))
+        };
+        assert!(named(1, "string.special.key"), "`kind` is a key");
+        assert!(named(1, "string"), "`Pod` is a string");
+        assert!(named(2, "number"), "`3` is a number");
+        assert!(named(3, "constant.builtin"), "`null` is a constant");
+    }
+}
