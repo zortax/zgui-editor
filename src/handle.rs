@@ -793,13 +793,15 @@ impl EditorHandle {
             self.ctx.document.broadcast(change, self.ctx.view_id.get());
         }
 
-        // The reports.
+        // The reports. The revision is read before the report goes out, because a listener that
+        // acts on the change reaches back into the editor.
+        let revision = self.ctx.shared.borrow().revision();
         let report = self.ctx.on_event.borrow();
         if let Some(tell) = report.as_ref() {
             if let Some(change) = response.change.as_ref() {
                 tell(EditorEvent::Edited {
                     kind: change.kind,
-                    revision: self.ctx.shared.borrow().revision(),
+                    revision,
                     changes: Arc::clone(&change.changes),
                 });
             } else if response.selection_changed {
