@@ -54,8 +54,9 @@ pub struct TextStyle {
     pub underline: bool,
     /// A straight line through the glyphs, in their colour.
     pub strikethrough: bool,
-    /// The colour and the background swap. A missing one is the text colour or the element's
-    /// background.
+    /// The colour and the background swap. A missing colour is the text colour. A missing
+    /// background is the element's background, or black or white against the text colour when
+    /// the element has no background of its own.
     pub inverse: bool,
 }
 
@@ -124,6 +125,7 @@ impl StyleState {
     /// Resolves every style, with `paint` answering a colour and `fg` and `bg` standing for the
     /// text colour and the element background. Moves the version when a look changed.
     pub fn resolve(&mut self, paint: impl Fn(&Paint) -> Color, fg: Color, bg: Color) {
+        let bg = if bg.alpha() < 0.5 { contrast(fg) } else { bg };
         let looks: Vec<Look> = self
             .table
             .iter()
@@ -228,6 +230,19 @@ impl StyleState {
     }
 }
 
+/// Black or white, whichever stands out against `color`.
+fn contrast(color: Color) -> Color {
+    let [red, green, blue] = color
+        .to_space(zgui::canvas::zgui_color::ColorSpace::Srgb)
+        .components();
+    let light = 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+    if light > 0.5 {
+        Color::srgb(0.0, 0.0, 0.0, 1.0)
+    } else {
+        Color::srgb(1.0, 1.0, 1.0, 1.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use smallvec::smallvec;
@@ -276,6 +291,21 @@ mod tests {
         let look = state.looks_of(0)[0].2;
         assert_eq!(look.color, Some(bg()));
         assert_eq!(look.background, Some(fg()));
+    }
+
+    #[test]
+    fn inverse_over_a_clear_element_takes_a_contrasting_colour() {
+        let mut state = StyleState::default();
+        state.set_table(vec![TextStyle {
+            inverse: true,
+            ..TextStyle::default()
+        }]);
+        state.resolve(|_| red(), fg(), Color::srgb(0.0, 0.0, 0.0, 0.0));
+        state.put_line(0, smallvec![(0, 1, 0)]);
+        assert_eq!(
+            state.looks_of(0)[0].2.color,
+            Some(Color::srgb(0.0, 0.0, 0.0, 1.0))
+        );
     }
 
     #[test]
