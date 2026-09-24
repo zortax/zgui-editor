@@ -6,6 +6,8 @@
 //! framework, and everything else is `--editor-*` or `--syntax-*`. What a sheet does not name
 //! falls back to something derived from those two, so an unthemed editor is already readable.
 
+use std::borrow::Cow;
+
 use zgui::canvas::zgui_color::Color;
 use zgui_css::ComputedStyle;
 
@@ -76,7 +78,7 @@ pub struct Theme {
     /// The scrollbar track, when a sheet asks for one.
     pub scrollbar_track: Option<Color>,
     /// The syntax colours a sheet named, by capture name with dots as hyphens.
-    pub syntax: Vec<(&'static str, Color)>,
+    pub syntax: Vec<(Cow<'static, str>, Color)>,
 }
 
 /// A colour with its alpha replaced.
@@ -90,7 +92,11 @@ fn read(style: &ComputedStyle, name: &str) -> Option<Color> {
 }
 
 /// The theme `style` describes.
-pub fn from_style(style: &ComputedStyle) -> Theme {
+///
+/// The syntax colours are the conventional vocabulary plus every name in `captures` and each
+/// shorter name along its dots, so an application that colours its own captures names their
+/// colours in the sheet as well.
+pub fn from_style(style: &ComputedStyle, captures: &[String]) -> Theme {
     let fg = zgui_css::values::color::to_color(zgui_css::values::color::current(style));
     let bg = zgui_css::values::color::resolve(
         &style.get_background().background_color,
@@ -98,10 +104,24 @@ pub fn from_style(style: &ComputedStyle) -> Theme {
     );
     let selection = read(style, "editor-selection").unwrap_or_else(|| with_alpha(fg, 0.25));
     let cursor = read(style, "editor-cursor").unwrap_or(fg);
-    let mut syntax = Vec::new();
+    let mut syntax: Vec<(Cow<'static, str>, Color)> = Vec::new();
     for name in SYNTAX_NAMES {
         if let Some(color) = read(style, &format!("syntax-{name}")) {
-            syntax.push((*name, color));
+            syntax.push((Cow::Borrowed(*name), color));
+        }
+    }
+    for capture in captures {
+        let mut name = capture.replace('.', "-");
+        loop {
+            let known = SYNTAX_NAMES.contains(&name.as_str())
+                || syntax.iter().any(|(held, _)| *held == name);
+            if !known && let Some(color) = read(style, &format!("syntax-{name}")) {
+                syntax.push((Cow::Owned(name.clone()), color));
+            }
+            match name.rfind('-') {
+                Some(cut) => name.truncate(cut),
+                None => break,
+            }
         }
     }
     Theme {
@@ -169,7 +189,7 @@ mod tests {
     fn capture_colours_fall_back_along_their_dots() {
         let mut theme = Theme::fallback();
         let green = Color::srgb(0.0, 1.0, 0.0, 1.0);
-        theme.syntax.push(("function", green));
+        theme.syntax.push((Cow::Borrowed("function"), green));
         assert_eq!(theme.capture_color("function.method"), green);
         assert_eq!(theme.capture_color("function"), green);
         assert_eq!(theme.capture_color("keyword"), theme.fg);

@@ -155,7 +155,39 @@ impl Document {
             )
             .change
         };
+        self.spread(change)
+    }
 
+    /// Replaces `replacements` in the text as its owner, with no view acting.
+    ///
+    /// The change goes through a read-only document and records no undo step, so the history
+    /// starts empty after it. This is how a document that shows text written elsewhere takes new
+    /// text: a log gets its newest lines at the end and loses its oldest at the start, while the
+    /// people who read it can select and copy but never type. Every view is told, and one view
+    /// reports it, as [`apply`](Self::apply) does.
+    ///
+    /// ```
+    /// # use zgui_editor::Document;
+    /// let document = Document::new("one\n");
+    /// assert!(document.write(vec![(4..4, "two\n".to_owned())]));
+    /// assert_eq!(document.text(), "one\ntwo\n");
+    /// ```
+    pub fn write(&self, replacements: Vec<(Range<usize>, String)>) -> bool {
+        let change = {
+            let mut state = self.inner.state.borrow_mut();
+            let mut selections = Selections::caret(0);
+            EditorState {
+                doc: &mut state,
+                selections: &mut selections,
+            }
+            .write(replacements)
+            .change
+        };
+        self.spread(change)
+    }
+
+    /// Tells the views about `change` and reports it. Answers whether there was one.
+    fn spread(&self, change: Option<ChangeInfo>) -> bool {
         // Told outside the borrow: a view hearing about a change reads the document.
         match change {
             Some(change) => {
@@ -356,6 +388,16 @@ mod tests {
         document.inner.state.borrow_mut().options.read_only = true;
         assert!(!document.apply(vec![(0..4, "other".to_owned())]));
         assert_eq!(document.text(), "text");
+    }
+
+    #[test]
+    fn a_write_reaches_a_read_only_document_and_leaves_no_history() {
+        let document = Document::new("one\n");
+        document.apply(vec![(0..3, "two".to_owned())]);
+        document.inner.state.borrow_mut().options.read_only = true;
+        assert!(document.write(vec![(4..4, "three\n".to_owned())]));
+        assert_eq!(document.text(), "two\nthree\n");
+        document.with_history(|history| assert_eq!(history.undo_depth(), 0));
     }
 
     #[test]

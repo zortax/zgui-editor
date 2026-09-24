@@ -10,7 +10,8 @@ pub mod registry;
 pub mod spans;
 pub mod worker;
 
-use rustc_hash::FxHashMap;
+use std::collections::BTreeMap;
+
 use smallvec::SmallVec;
 use zgui::canvas::zgui_color::Color;
 
@@ -25,7 +26,10 @@ pub struct SyntaxState {
     /// Moves whenever the held spans change, so line caches know to re-colour.
     version: u64,
     /// Spans by line index, in line-local byte offsets.
-    spans: FxHashMap<usize, SmallVec<[LineSpan; 8]>>,
+    ///
+    /// Ordered, so a change moves only the lines after it: a line added at the end of a long
+    /// buffer costs a lookup, and an edit near the top moves what lies below it.
+    spans: BTreeMap<usize, SmallVec<[LineSpan; 8]>>,
     /// The capture names of the loaded language, by capture index.
     capture_names: Vec<String>,
     /// Each capture's colour under the current theme, by capture index.
@@ -46,6 +50,11 @@ impl SyntaxState {
         self.version += 1;
     }
 
+    /// The capture names the spans count into.
+    pub fn capture_names(&self) -> &[String] {
+        &self.capture_names
+    }
+
     /// Re-resolves every capture colour, which a theme change makes necessary.
     pub fn resolve_colors(&mut self, theme: &Theme) {
         self.capture_colors = self
@@ -60,6 +69,11 @@ impl SyntaxState {
         self.spans.insert(line, spans);
     }
 
+    /// Forgets the spans for `line`.
+    pub fn remove_line(&mut self, line: usize) {
+        self.spans.remove(&line);
+    }
+
     /// Says a batch of stored lines changed, once per frame of arrivals.
     pub fn bump(&mut self) {
         self.version += 1;
@@ -67,7 +81,7 @@ impl SyntaxState {
 
     /// Forgets every span at or after `line`, which an edit there makes suspect.
     pub fn invalidate_from(&mut self, line: usize) {
-        self.spans.retain(|held, _| *held < line);
+        self.spans.split_off(&line);
         self.version += 1;
     }
 
@@ -87,17 +101,14 @@ impl SyntaxState {
         } else {
             first
         };
-        let mut moved = FxHashMap::default();
-        for (line, spans) in self.spans.drain() {
-            if line < first {
-                moved.insert(line, spans);
-            } else if line < removed_until {
+        let below = self.spans.split_off(&first);
+        for (line, spans) in below {
+            if line < removed_until {
                 // Gone with the deleted lines.
             } else if let Some(shifted) = line.checked_add_signed(delta) {
-                moved.insert(shifted, spans);
+                self.spans.insert(shifted, spans);
             }
         }
-        self.spans = moved;
         self.version += 1;
     }
 
@@ -143,5 +154,27 @@ mod tests {
         assert_eq!(coloured.len(), 2);
         assert_eq!((coloured[0].0, coloured[0].1), (0, 2));
         assert!(state.colored_spans(4).is_empty());
+    }
+
+    #[test]
+    fn a_shift_moves_only_the_lines_after_the_change() {
+        let mut state = SyntaxState::default();
+        let theme = Theme::fallback();
+        state.set_captures(vec!["keyword".into()], &theme);
+        for line in [0, 2, 5] {
+            state.put_line(line, SmallVec::from_vec(vec![(0, 1, 0)]));
+        }
+        state.shift_lines(2, 3);
+        assert!(!state.colored_spans(0).is_empty());
+        assert!(!state.colored_spans(5).is_empty());
+        assert!(!state.colored_spans(8).is_empty());
+        assert!(state.colored_spans(2).is_empty());
+
+        // Lines 0 to 4 go: line 0 takes its spans along, 5 and 8 move up to 0 and 3.
+        state.shift_lines(0, -5);
+        assert!(!state.colored_spans(0).is_empty());
+        assert!(!state.colored_spans(3).is_empty());
+        assert!(state.colored_spans(5).is_empty());
+        assert!(state.colored_spans(8).is_empty());
     }
 }

@@ -435,7 +435,7 @@ impl EditorShared {
             self.max_line_width = 0.0;
         }
 
-        let theme = theme::from_style(style);
+        let theme = theme::from_style(style, self.syntax.capture_names());
         if theme != self.theme {
             self.syntax.resolve_colors(&theme);
             self.theme = theme;

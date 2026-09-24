@@ -464,6 +464,19 @@ impl EditorState<'_> {
         self.edit(ranges, kind, None)
     }
 
+    /// Replaces `replacements` as the owner of the text, and moves the selections.
+    ///
+    /// The change goes through a read-only buffer and records no undo step. The history then
+    /// addresses text that has moved, so it starts empty. This is how a buffer that shows
+    /// something written elsewhere, such as a log, takes new text while people only read it.
+    pub fn write(&mut self, replacements: Vec<(Range<usize>, String)>) -> Response {
+        let response = self.replace(replacements, EditKind::Other, None, false);
+        if response.change.is_some() {
+            self.doc.history = History::new();
+        }
+        response
+    }
+
     /// Applies `replacements` as one transaction, records it, and moves the selections.
     ///
     /// Selections map through the edits by default — a caret inside a replaced range lands after
@@ -471,13 +484,25 @@ impl EditorState<'_> {
     /// pre-edit positions, each mapped through the transaction.
     fn edit(
         &mut self,
-        mut replacements: Vec<(Range<usize>, String)>,
+        replacements: Vec<(Range<usize>, String)>,
         kind: EditKind,
         carets: Option<Vec<usize>>,
     ) -> Response {
         if self.doc.options.read_only {
             return Response::nothing();
         }
+        self.replace(replacements, kind, carets, true)
+    }
+
+    /// Applies `replacements` as one transaction and moves the selections. `record` says whether
+    /// the transaction goes into the history.
+    fn replace(
+        &mut self,
+        mut replacements: Vec<(Range<usize>, String)>,
+        kind: EditKind,
+        carets: Option<Vec<usize>>,
+        record: bool,
+    ) -> Response {
         replacements.sort_by_key(|(range, _)| range.start);
         replacements.dedup_by(|later, earlier| {
             // Overlapping requests are a caller error; the earlier one wins.
@@ -538,7 +563,9 @@ impl EditorState<'_> {
             .unwrap_or(0);
         let input_edits = tx.input_edits(&before_rope);
         let changes: Arc<[TextChange]> = Arc::from(tx.changes());
-        self.doc.history.push(tx);
+        if record {
+            self.doc.history.push(tx);
+        }
 
         Response {
             change: Some(ChangeInfo {
@@ -1066,6 +1093,22 @@ mod tests {
         assert_eq!(editor.doc.buffer.to_string(), "    one\n    two");
         apply(&mut editor, Command::IndentLines { dedent: true });
         assert_eq!(editor.doc.buffer.to_string(), "one\ntwo");
+    }
+
+    #[test]
+    fn a_write_goes_through_a_read_only_buffer_and_records_nothing() {
+        let mut editor = editor("one\n");
+        apply(&mut editor, Command::Insert("x".to_string()));
+        editor.doc.options.read_only = true;
+        let response = editor.state().write(vec![(5..5, "two\n".to_string())]);
+        assert!(response.change.is_some());
+        assert_eq!(editor.doc.buffer.to_string(), "xone\ntwo\n");
+        let undone = apply(&mut editor, Command::Undo);
+        assert!(
+            undone.change.is_none(),
+            "the history starts over after a write"
+        );
+        assert_eq!(editor.doc.buffer.to_string(), "xone\ntwo\n");
     }
 
     #[test]

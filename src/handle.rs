@@ -497,13 +497,45 @@ impl EditorHandle {
         captures: Vec<String>,
         lines: Vec<smallvec::SmallVec<[crate::syntax::LineSpan; 8]>>,
     ) {
-        {
+        let renamed = {
             let mut shared = self.ctx.shared.borrow_mut();
+            let renamed = shared.syntax.capture_names() != captures.as_slice();
             let theme = shared.theme.clone();
             shared.syntax.set_captures(captures, &theme);
             for (line, spans) in lines.into_iter().enumerate() {
                 if !spans.is_empty() {
                     shared.syntax.put_line(line, spans);
+                }
+            }
+            shared.syntax.bump();
+            renamed
+        };
+        // A new vocabulary may name colours the last layout never read off the sheet.
+        if renamed {
+            self.ctx.element.relayout();
+        } else {
+            self.ctx.element.repaint();
+        }
+    }
+
+    /// Colours the lines from `first` on with `lines`, one entry per line, and keeps every other
+    /// line and the vocabulary [`set_highlights`](Self::set_highlights) gave.
+    ///
+    /// An empty entry takes the colours off its line. What text that only grows is coloured
+    /// with: a log colours the lines that arrived and leaves the rest alone. Held spans move with
+    /// the lines an edit adds or removes above them.
+    pub fn put_highlights(
+        &self,
+        first: usize,
+        lines: Vec<smallvec::SmallVec<[crate::syntax::LineSpan; 8]>>,
+    ) {
+        {
+            let mut shared = self.ctx.shared.borrow_mut();
+            for (offset, spans) in lines.into_iter().enumerate() {
+                if spans.is_empty() {
+                    shared.syntax.remove_line(first + offset);
+                } else {
+                    shared.syntax.put_line(first + offset, spans);
                 }
             }
             shared.syntax.bump();
@@ -700,7 +732,11 @@ impl EditorHandle {
                     goal_col: None,
                 });
             }
+            let top = shared.scroll.pos.line;
             shared.absorb_change(change);
+            if !change.whole_text && shared.line_window().is_none() {
+                pin(&mut shared, change, top);
+            }
             self.update_signals(&mut shared);
         }
         self.ctx.element.relayout();
@@ -964,6 +1000,30 @@ impl EditorHandle {
             height: shared.metrics.line_height / scale,
         })
     }
+}
+
+/// Keeps the text at the top of a view where it was after another view or the document owner
+/// added or removed lines above it.
+///
+/// A view that stood at `top` before `change` moves by as many lines as the change added or
+/// removed above that line, so the reader goes on reading the same text.
+fn pin(shared: &mut EditorShared, change: &ChangeInfo, top: f64) {
+    let above: isize = change
+        .input_edits
+        .iter()
+        .filter(|edit| (edit.old_end_position.row as f64) < top.floor())
+        .map(|edit| edit.new_end_position.row as isize - edit.old_end_position.row as isize)
+        .sum();
+    if above == 0 {
+        return;
+    }
+    let total = shared.line_count();
+    let viewport = shared.viewport_lines();
+    let moved = above as f64;
+    let target = shared.scroll.target_line + moved;
+    shared.scroll.scroll_to(top + moved, total, viewport);
+    shared.scroll.target_line =
+        target.clamp(0.0, crate::scroll::ScrollState::max_top(total, viewport));
 }
 
 /// The framework's name for one of ours.
