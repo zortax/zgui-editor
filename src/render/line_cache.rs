@@ -15,6 +15,7 @@ use smallvec::SmallVec;
 use zgui::canvas::zgui_color::Color;
 
 use crate::render::shaping::ShapedLine;
+use crate::styles::Look;
 
 /// One same-coloured stretch of one run's glyphs.
 #[derive(Clone, Debug, PartialEq)]
@@ -25,6 +26,10 @@ pub struct Slice {
     pub glyphs: Range<u32>,
     /// The colour they are drawn in.
     pub color: Color,
+    /// Whether they are emboldened.
+    pub bold: bool,
+    /// Whether they are sheared.
+    pub italic: bool,
 }
 
 /// One line, ready to paint.
@@ -38,6 +43,8 @@ pub struct CachedLine {
     pub hl_version: u64,
     /// The theme version the slices were coloured at.
     pub theme_version: u32,
+    /// The text style version the slices were coloured at.
+    pub style_version: u64,
     /// The shaped text.
     pub shaped: ShapedLine,
     /// The colour slices, covering every glyph of every run.
@@ -96,12 +103,14 @@ impl LineCache {
 /// The colour slices for `shaped`, given `spans` over the buffer line's bytes.
 ///
 /// `spans` are `(start, end, color)` in **buffer** byte offsets of the line, sorted by start and
-/// non-overlapping. Every glyph outside every span is drawn in `default`. Glyphs are coloured
-/// one at a time by their cluster byte and merged when neighbours agree, which is what makes a
+/// non-overlapping. Every glyph outside every span is drawn in `default`. `looks` are the text
+/// styles of the line in the same form, and go over the colours. Glyphs are coloured one at a
+/// time by their cluster byte and merged when neighbours agree, which is what makes a
 /// right-to-left run — whose cluster bytes descend — come out right without being special.
 pub fn build_slices(
     shaped: &ShapedLine,
     spans: &[(u32, u32, Color)],
+    looks: &[(u32, u32, Look)],
     default: Color,
 ) -> SmallVec<[Slice; 8]> {
     let mut slices: SmallVec<[Slice; 8]> = SmallVec::new();
@@ -109,9 +118,17 @@ pub fn build_slices(
         let mut open: Option<Slice> = None;
         for (glyph_index, cluster) in run.clusters.iter().enumerate() {
             let buffer_byte = shaped.tab_map.to_buffer(*cluster);
-            let color = color_at(spans, buffer_byte, default);
+            let mut color = color_at(spans, buffer_byte, default);
+            let look = look_at(looks, buffer_byte);
+            if let Some(look) = look {
+                color = look.glyph_color(color);
+            }
+            let bold = look.is_some_and(|look| look.bold);
+            let italic = look.is_some_and(|look| look.italic);
             match open.as_mut() {
-                Some(slice) if slice.color == color => {
+                Some(slice)
+                    if slice.color == color && slice.bold == bold && slice.italic == italic =>
+                {
                     slice.glyphs.end = glyph_index as u32 + 1;
                 }
                 _ => {
@@ -122,6 +139,8 @@ pub fn build_slices(
                         run: run_index as u16,
                         glyphs: glyph_index as u32..glyph_index as u32 + 1,
                         color,
+                        bold,
+                        italic,
                     });
                 }
             }
@@ -143,6 +162,13 @@ fn color_at(spans: &[(u32, u32, Color)], byte: u32, default: Color) -> Color {
         }
     }
     default
+}
+
+/// The look `looks` give the glyph whose cluster starts at `byte`.
+fn look_at(looks: &[(u32, u32, Look)], byte: u32) -> Option<Look> {
+    let index = looks.partition_point(|(start, _, _)| *start <= byte);
+    let (_, end, look) = looks.get(index.checked_sub(1)?)?;
+    (byte < *end).then_some(*look)
 }
 
 /// Where a caret at `buffer_byte` of this line sits, in device pixels from the line's left edge.
@@ -235,7 +261,7 @@ mod tests {
     fn slices_merge_neighbours_of_one_colour() {
         let shaped = line(vec![0, 1, 2, 3], vec![0.0, 8.0, 16.0, 24.0], 32.0);
         let spans = [(1u32, 3u32, color(0.5))];
-        let slices = build_slices(&shaped, &spans, color(0.0));
+        let slices = build_slices(&shaped, &spans, &[], color(0.0));
         assert_eq!(slices.len(), 3);
         assert_eq!(slices[0].glyphs, 0..1);
         assert_eq!(slices[1].glyphs, 1..3);
@@ -247,10 +273,27 @@ mod tests {
     fn a_descending_rtl_run_still_slices_by_colour() {
         let shaped = line(vec![3, 2, 1, 0], vec![0.0, 8.0, 16.0, 24.0], 32.0);
         let spans = [(0u32, 2u32, color(0.5))];
-        let slices = build_slices(&shaped, &spans, color(0.0));
+        let slices = build_slices(&shaped, &spans, &[], color(0.0));
         assert_eq!(slices.len(), 2, "two visual stretches");
         assert_eq!(slices[0].color, color(0.0));
         assert_eq!(slices[1].color, color(0.5));
+    }
+
+    #[test]
+    fn a_text_style_goes_over_the_highlight_and_splits_by_weight() {
+        let shaped = line(vec![0, 1, 2, 3], vec![0.0, 8.0, 16.0, 24.0], 32.0);
+        let spans = [(0u32, 4u32, color(0.5))];
+        let bold = Look {
+            color: Some(color(0.9)),
+            bold: true,
+            ..Look::default()
+        };
+        let looks = [(2u32, 4u32, bold)];
+        let slices = build_slices(&shaped, &spans, &looks, color(0.0));
+        assert_eq!(slices.len(), 2);
+        assert_eq!((slices[0].color, slices[0].bold), (color(0.5), false));
+        assert_eq!(slices[1].glyphs, 2..4);
+        assert_eq!((slices[1].color, slices[1].bold), (color(0.9), true));
     }
 
     #[test]

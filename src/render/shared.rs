@@ -35,10 +35,17 @@ use crate::render::shaping::ShapingCache;
 use crate::render::theme::{self, Theme};
 use crate::render::{families, gutter};
 use crate::scroll::{ScrollState, Scrollbar};
+use crate::styles::StyleState;
 use crate::syntax::SyntaxState;
 
 /// How wide the scrollbar is, in device pixels at scale one.
 const SCROLLBAR_WIDTH: f32 = 10.0;
+
+/// How much a bold text style emboldens its glyphs, as a fraction of the size.
+const SYNTHETIC_BOLD: f32 = 0.02;
+
+/// How far an italic text style shears its glyphs, in degrees.
+const SYNTHETIC_SLANT: f32 = 14.0;
 
 /// What `layout` reports outward when the style or the space changed.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -83,6 +90,8 @@ pub struct EditorShared {
     pub lines: LineCache,
     /// What the highlighter has said so far.
     pub syntax: SyntaxState,
+    /// The text styles the application put on the lines.
+    pub styles: StyleState,
     /// Marks the application drew on the text.
     pub decorations: Layers<Decoration>,
     /// Marks the application drew in the gutter.
@@ -141,6 +150,7 @@ impl EditorShared {
             shaping: ShapingCache::new(),
             lines: LineCache::default(),
             syntax: SyntaxState::default(),
+            styles: StyleState::default(),
             decorations: Layers::default(),
             gutter_marks: Layers::default(),
             gutter_source: None,
@@ -185,6 +195,7 @@ impl EditorShared {
             // Nothing about the old text survives, so nothing cached about it can.
             self.lines.clear();
             self.syntax.clear();
+            self.styles.clear();
             self.max_line_width = 0.0;
             self.max_line_chars = None;
         } else {
@@ -210,6 +221,8 @@ impl EditorShared {
             } else {
                 self.lines.invalidate_from(change.first_changed_line);
                 self.syntax
+                    .shift_lines(change.first_changed_line, line_delta);
+                self.styles
                     .shift_lines(change.first_changed_line, line_delta);
             }
         }
@@ -442,6 +455,7 @@ impl EditorShared {
             self.theme_version = self.theme_version.wrapping_add(1);
         }
         self.resolve_decoration_colors(style);
+        self.resolve_looks();
 
         if !final_pass {
             return;
@@ -508,7 +522,22 @@ impl EditorShared {
         self.decorations
             .properties()
             .chain(self.gutter_marks.properties())
+            .chain(self.styles.properties())
             .chain(source)
+    }
+
+    /// Resolves the text styles with the colours the sheet answered.
+    pub fn resolve_looks(&mut self) {
+        let (fg, bg) = (self.theme.fg, self.theme.bg);
+        let colors = &self.decoration_colors;
+        self.styles.resolve(
+            |paint| match paint {
+                Paint::Color(color) => *color,
+                Paint::Property(name) => colors.get(name.as_ref()).copied().flatten().unwrap_or(fg),
+            },
+            fg,
+            bg,
+        );
     }
 
     /// Whether any decoration names a property that has not been looked up yet.
@@ -610,23 +639,29 @@ impl EditorShared {
         let generation = self.metrics.generation;
         let hl_version = self.syntax.version();
         let theme_version = self.theme_version;
+        let style_version = self.styles.version();
 
         if let Some(cached) = self.lines.get(line)
             && cached.revision == revision
             && cached.generation == generation
         {
-            if cached.hl_version == hl_version && cached.theme_version == theme_version {
+            if cached.hl_version == hl_version
+                && cached.theme_version == theme_version
+                && cached.style_version == style_version
+            {
                 return Some(cached.clone());
             }
             // The text is fine; only the colours moved.
             let shaped = cached.shaped.clone();
             let spans = self.syntax.colored_spans(line);
-            let slices = line_cache::build_slices(&shaped, &spans, self.theme.fg);
+            let looks = self.styles.looks_of(line);
+            let slices = line_cache::build_slices(&shaped, &spans, &looks, self.theme.fg);
             let rebuilt = CachedLine {
                 revision,
                 generation,
                 hl_version,
                 theme_version,
+                style_version,
                 shaped,
                 slices,
             };
@@ -644,12 +679,14 @@ impl EditorShared {
             .shape(shaper, &self.families, &text, &self.metrics);
         self.max_line_width = self.max_line_width.max(shaped.width);
         let spans = self.syntax.colored_spans(line);
-        let slices = line_cache::build_slices(&shaped, &spans, self.theme.fg);
+        let looks = self.styles.looks_of(line);
+        let slices = line_cache::build_slices(&shaped, &spans, &looks, self.theme.fg);
         let cached = CachedLine {
             revision,
             generation,
             hl_version,
             theme_version,
+            style_version,
             shaped,
             slices,
         };
@@ -747,6 +784,7 @@ impl EditorShared {
         // The bands an application asked for, under the selection so that selecting decorated
         // text still reads as selected.
         self.paint_decoration_bands(painter, &visible, text_x0);
+        self.paint_style_bands(painter, &visible, text_x0);
 
         // Selection bands.
         let selection_color = if self.focused {
@@ -868,6 +906,16 @@ impl EditorShared {
                 let run = &cached.shaped.runs[slice.run as usize];
                 let borrowed = ShapedRun {
                     glyphs: &run.glyphs[slice.glyphs.start as usize..slice.glyphs.end as usize],
+                    synthetic_bold: if slice.bold {
+                        run.synthetic_bold.max(SYNTHETIC_BOLD)
+                    } else {
+                        run.synthetic_bold
+                    },
+                    synthetic_slant: if slice.italic && run.synthetic_slant == 0.0 {
+                        SYNTHETIC_SLANT
+                    } else {
+                        run.synthetic_slant
+                    },
                     ..run.as_run(PaintSlot(0))
                 };
                 painter.glyphs(&borrowed, origin, slice.color);
@@ -876,6 +924,7 @@ impl EditorShared {
 
         // The lines under the text, over it so a descender never hides an error.
         self.paint_decoration_underlines(painter, &visible, text_x0);
+        self.paint_style_lines(painter, &visible, text_x0);
 
         // The carets.
         if self.focused
@@ -995,6 +1044,90 @@ impl EditorShared {
                     line_height,
                     color,
                 );
+            }
+        }
+    }
+
+    /// Draws the backgrounds of the text styles behind the text.
+    fn paint_style_bands(
+        &mut self,
+        painter: &mut ScenePainter<'_>,
+        visible: &Range<usize>,
+        text_x0: f32,
+    ) {
+        if self.styles.is_empty() {
+            return;
+        }
+        let line_height = self.metrics.line_height;
+        for line in visible.clone() {
+            let looks = self.styles.looks_of(line);
+            if looks.iter().all(|(_, _, look)| look.background.is_none()) {
+                continue;
+            }
+            let Some(cached) = self.ensure_line(line) else {
+                continue;
+            };
+            let y = self.line_y(line);
+            for (start, end, look) in looks {
+                let Some(color) = look.background else {
+                    continue;
+                };
+                let x0 = line_cache::caret_x(&cached.shaped, start);
+                let x1 = line_cache::caret_x(&cached.shaped, end);
+                fill(
+                    painter,
+                    text_x0 + x0,
+                    y,
+                    (x1 - x0).max(1.0),
+                    line_height,
+                    color,
+                );
+            }
+        }
+    }
+
+    /// Draws the underlines and the strike lines of the text styles over the text.
+    fn paint_style_lines(
+        &mut self,
+        painter: &mut ScenePainter<'_>,
+        visible: &Range<usize>,
+        text_x0: f32,
+    ) {
+        if self.styles.is_empty() {
+            return;
+        }
+        let metrics = self.metrics;
+        let thickness = metrics.scale.max(1.0);
+        for line in visible.clone() {
+            let looks = self.styles.looks_of(line);
+            if looks
+                .iter()
+                .all(|(_, _, look)| !look.underline && !look.strikethrough)
+            {
+                continue;
+            }
+            let Some(cached) = self.ensure_line(line) else {
+                continue;
+            };
+            let top = self.line_y(line);
+            let colors = self.syntax.colored_spans(line);
+            for (start, end, look) in looks {
+                let x0 = line_cache::caret_x(&cached.shaped, start);
+                let x1 = line_cache::caret_x(&cached.shaped, end);
+                let base = colors
+                    .iter()
+                    .find(|(from, to, _)| *from <= start && start < *to)
+                    .map_or(self.theme.fg, |(_, _, color)| *color);
+                let color = look.glyph_color(base);
+                let width = (x1 - x0).max(1.0);
+                if look.underline {
+                    let y = top + metrics.baseline + thickness;
+                    fill(painter, text_x0 + x0, y, width, thickness, color);
+                }
+                if look.strikethrough {
+                    let y = top + metrics.baseline - metrics.ascent * 0.3;
+                    fill(painter, text_x0 + x0, y, width, thickness, color);
+                }
             }
         }
     }

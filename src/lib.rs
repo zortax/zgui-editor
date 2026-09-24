@@ -40,6 +40,9 @@
 //! character a caret is on, take whole lines, and reach past the end of a short line, none of
 //! which a byte range says.
 //!
+//! [`styles`] puts colours, weights, slants and lines on stretches of the text over the
+//! highlighter, which is what terminal output is shown with.
+//!
 //! # A view of one part of a document
 //!
 //! [`EditorConfig::line_window`] makes the view draw exactly the lines it names and size itself to
@@ -68,6 +71,7 @@ pub mod input;
 pub mod overlay;
 pub mod render;
 pub mod scroll;
+pub mod styles;
 pub mod syntax;
 mod view;
 
@@ -85,6 +89,7 @@ pub use crate::document::Document;
 pub use crate::event::{EditorEvent, KeyFilter};
 pub use crate::handle::{CaretRect, CursorPos, EditorHandle, EditorSnapshot, ScrollSnapshot};
 pub use crate::overlay::{Band, Caret, Overlay};
+pub use crate::styles::{StyleSpan, StyleSpans, TextStyle};
 pub use crate::syntax::oneshot::{Highlighted, highlight};
 pub use crate::syntax::registry::{LanguageConfig, LanguageRegistry};
 pub use crate::view::{Editor, EditorProps};

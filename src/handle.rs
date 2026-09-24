@@ -543,6 +543,43 @@ impl EditorHandle {
         self.ctx.element.repaint();
     }
 
+    /// Replaces the table of text styles the spans of
+    /// [`put_text_styles`](Self::put_text_styles) count into. The spans stay.
+    pub fn set_text_styles(&self, table: Vec<crate::styles::TextStyle>) {
+        let needs_style = {
+            let mut shared = self.ctx.shared.borrow_mut();
+            if shared.styles.table() == table.as_slice() {
+                return;
+            }
+            shared.styles.set_table(table);
+            shared.resolve_looks();
+            shared.decorations_need_style()
+        };
+        self.after_marks(true, needs_style);
+    }
+
+    /// Styles the lines from `first` on with `lines`, one entry per line, and keeps every other
+    /// line.
+    ///
+    /// An empty entry takes the styles off its line. Held spans move with the lines an edit adds
+    /// or removes above them, and a replaced text drops them.
+    pub fn put_text_styles(&self, first: usize, lines: Vec<crate::styles::StyleSpans>) {
+        {
+            let mut shared = self.ctx.shared.borrow_mut();
+            for (offset, spans) in lines.into_iter().enumerate() {
+                shared.styles.put_line(first + offset, spans);
+            }
+            shared.styles.bump();
+        }
+        self.ctx.element.repaint();
+    }
+
+    /// Takes every text style off the text. The table stays.
+    pub fn clear_text_styles(&self) {
+        self.ctx.shared.borrow_mut().styles.clear();
+        self.ctx.element.repaint();
+    }
+
     /// Says which lines the view draws, or that it draws all of them.
     ///
     /// The window moves as the caret moves between blocks of a rendered document, so it is set
