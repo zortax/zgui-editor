@@ -34,6 +34,7 @@ tree-sitter-md = { version = "0.5", optional = true }
 tree-sitter-python = { version = "0.25", optional = true }
 tree-sitter-yaml = { version = "0.7.2", optional = true }
 tree-sitter-json = { version = "0.24.8", optional = true }
+tree-sitter-bash = { version = "0.25.1", optional = true }
 
 [features]
 default = []
@@ -46,6 +47,7 @@ lang-markdown = ["dep:tree-sitter-md"]
 lang-python = ["dep:tree-sitter-python"]
 lang-yaml = ["dep:tree-sitter-yaml"]
 lang-json = ["dep:tree-sitter-json"]
+lang-bash = ["dep:tree-sitter-bash"]
 all-languages = [
     "lang-rust",
     "lang-toml",
@@ -53,9 +55,11 @@ all-languages = [
     "lang-python",
     "lang-yaml",
     "lang-json",
+    "lang-bash",
 ]
 tree-sitter-yaml = ["dep:tree-sitter-yaml"]
 tree-sitter-json = ["dep:tree-sitter-json"]
+tree-sitter-bash = ["dep:tree-sitter-bash"]
 
 [dev-dependencies]
 zgui-testkit-view = { git = "https://github.com/zortax/zgui" }

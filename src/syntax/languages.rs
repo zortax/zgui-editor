@@ -55,4 +55,13 @@ pub(crate) fn register_bundled(registry: &crate::syntax::registry::LanguageRegis
         injections_query: None,
         extensions: vec!["json".to_string()],
     });
+
+    #[cfg(feature = "lang-bash")]
+    registry.register(crate::syntax::registry::LanguageConfig {
+        name: "bash".to_string(),
+        language: tree_sitter_bash::LANGUAGE.into(),
+        highlight_query: tree_sitter_bash::HIGHLIGHT_QUERY.to_string(),
+        injections_query: None,
+        extensions: vec!["sh".to_string(), "bash".to_string()],
+    });
 }

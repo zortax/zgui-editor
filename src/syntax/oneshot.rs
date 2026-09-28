@@ -192,3 +192,38 @@ mod json_tests {
         assert!(named(3, "constant.builtin"), "`null` is a constant");
     }
 }
+
+#[cfg(test)]
+#[cfg(feature = "lang-bash")]
+mod bash_tests {
+    use super::*;
+
+    fn bash_config() -> LanguageConfig {
+        LanguageConfig {
+            name: "bash".to_string(),
+            language: tree_sitter_bash::LANGUAGE.into(),
+            highlight_query: tree_sitter_bash::HIGHLIGHT_QUERY.to_string(),
+            injections_query: None,
+            extensions: vec!["sh".to_string(), "bash".to_string()],
+        }
+    }
+
+    #[test]
+    fn the_bash_query_compiles_and_colours_a_script() {
+        let text = "# wait for the api\nif true; then\n  echo \"ready $HOME\"\nfi\n";
+        let answer = highlight(&bash_config(), text).expect("bash highlights");
+        assert_eq!(answer.lines.len(), Rope::from_str(text).len_lines());
+
+        let named = |line: usize, prefix: &str| {
+            answer.lines[line]
+                .iter()
+                .any(|(_, _, capture)| answer.captures[*capture as usize].starts_with(prefix))
+        };
+        assert!(named(0, "comment"), "the first line is a comment");
+        assert!(named(1, "keyword"), "`if` is a keyword");
+        assert!(named(2, "function"), "`echo` is a command");
+        assert!(named(2, "string"), "the quoted text is a string");
+        assert!(named(2, "property"), "`$HOME` is a variable");
+        assert!(named(3, "keyword"), "`fi` is a keyword");
+    }
+}

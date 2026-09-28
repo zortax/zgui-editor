@@ -91,4 +91,16 @@ mod tests {
         let config = registry.by_extension("json").expect("json is bundled");
         assert_eq!(config.name, "json");
     }
+
+    #[test]
+    #[cfg(feature = "lang-bash")]
+    fn bash_claims_both_of_its_extensions() {
+        let registry = LanguageRegistry::new().with_bundled();
+        for extension in ["sh", "bash"] {
+            let config = registry
+                .by_extension(extension)
+                .expect("a bundled language claims it");
+            assert_eq!(config.name, "bash");
+        }
+    }
 }
