@@ -367,6 +367,37 @@ fn a_wheel_glide_steps_every_frame_and_parks_at_its_target() {
     );
 }
 
+/// A line scroll glides when the editor scrolls smoothly and jumps when it does not.
+#[test]
+fn a_line_scroll_glides_only_when_scrolling_is_smooth() {
+    let text: &'static str = Box::leak("line\n".repeat(200).into_boxed_str());
+    let (mut harness, handle) = mounted(text);
+    harness.platform().offscreens()[0].set_refresh_rate_millihertz(Some(60_000));
+    harness.settle(8);
+
+    handle.command(zgui_editor::Command::Scroll(zgui_editor::ScrollCmd::Lines(
+        10.0,
+    )));
+    harness.settle(4);
+    let state = handle.scroll_state().get_untracked();
+    assert!(
+        state.top_line < 10.0,
+        "a smooth scroll starts a glide: {state:?}"
+    );
+    assert!((state.target_line - 10.0).abs() < 1e-9);
+
+    handle.set_smooth_scroll(false);
+    handle.command(zgui_editor::Command::Scroll(zgui_editor::ScrollCmd::Lines(
+        10.0,
+    )));
+    harness.settle(4);
+    let state = handle.scroll_state().get_untracked();
+    assert!(
+        (state.top_line - 20.0).abs() < 1e-9,
+        "a scroll that is not smooth jumps: {state:?}"
+    );
+}
+
 /// The quads of the frame after `handle` was made to paint again.
 ///
 /// Whatever the change owed is settled first — a relayout is a frame of its own — and then one

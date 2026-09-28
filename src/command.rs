@@ -166,6 +166,26 @@ pub enum Command {
     },
     /// Replaces the given byte ranges, the raw escape hatch completion and refactors use.
     ReplaceRanges(Vec<(std::ops::Range<usize>, String)>),
+    /// Replaces the given byte ranges and places the selections, as one undo step.
+    ///
+    /// The ranges address the text before the change. The selections address the text after it.
+    /// With no selections, they map through the change as they do for
+    /// [`ReplaceRanges`](Command::ReplaceRanges).
+    Edit {
+        /// The ranges and their new text.
+        replacements: Vec<(std::ops::Range<usize>, String)>,
+        /// Where the selections land, in the changed text.
+        selections: Option<Vec<Selection>>,
+        /// Which selection is primary, by index into `selections`.
+        primary: usize,
+        /// What kind of change it is, for coalescing and for listeners.
+        kind: crate::core::edit::EditKind,
+    },
+    /// Inserts one level of indentation at every selection.
+    ///
+    /// The level is [`EditOptions::indent`](crate::EditOptions::indent), or a tab when
+    /// [`EditOptions::hard_tabs`](crate::EditOptions::hard_tabs) is set.
+    InsertIndent,
     /// Indents (or dedents) every line a selection touches.
     IndentLines {
         /// Whether to remove a level instead of adding one.

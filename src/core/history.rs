@@ -31,6 +31,10 @@ pub struct History {
     redo: Vec<Step>,
     /// Whether the top of the undo stack may still grow by coalescing.
     open: bool,
+    /// How many undo groups are open. While one is open, every change joins one step.
+    group: usize,
+    /// Whether the open group has not recorded a change yet.
+    group_fresh: bool,
 }
 
 impl History {
@@ -44,6 +48,17 @@ impl History {
     /// Any recorded change makes the redoable future unreachable, so the redo stack empties.
     pub fn push(&mut self, tx: Transaction) {
         self.redo.clear();
+        if self.group > 0 {
+            match self.undo.last_mut() {
+                Some(top) if !self.group_fresh => top.transactions.push(tx),
+                _ => self.undo.push(Step {
+                    transactions: vec![tx],
+                }),
+            }
+            self.group_fresh = false;
+            self.open = true;
+            return;
+        }
         if self.open
             && let Some(top) = self.undo.last_mut()
             && tx.coalesces_with(
@@ -62,13 +77,51 @@ impl History {
 
     /// Ends the growing step, as a motion, a click, or a mode change does.
     pub fn seal(&mut self) {
-        self.open = false;
+        if self.group == 0 {
+            self.open = false;
+        }
+    }
+
+    /// Replaces where the newest transaction left the selections.
+    ///
+    /// Redo puts the selections back there. A change that places its own carets calls this.
+    pub fn amend_after(&mut self, after: crate::core::selection::Selections) {
+        if let Some(tx) = self
+            .undo
+            .last_mut()
+            .and_then(|step| step.transactions.last_mut())
+        {
+            tx.after = after;
+        }
+    }
+
+    /// Opens an undo group. Every change until the matching [`end_group`](Self::end_group)
+    /// undoes as one step. Groups nest; the outermost one decides the step.
+    pub fn begin_group(&mut self) {
+        if self.group == 0 {
+            self.group_fresh = true;
+        }
+        self.group += 1;
+    }
+
+    /// Closes an undo group. Closing the outermost group seals the step.
+    pub fn end_group(&mut self) {
+        self.group = self.group.saturating_sub(1);
+        if self.group == 0 {
+            self.open = false;
+        }
+    }
+
+    /// Whether an undo group is open.
+    pub fn in_group(&self) -> bool {
+        self.group > 0
     }
 
     /// The step to undo, when there is one. The caller applies each transaction's inversion,
     /// **newest first** — the order the step's iterator does not supply by itself.
     pub fn undo(&mut self) -> Option<Step> {
         self.open = false;
+        self.group = 0;
         let step = self.undo.pop()?;
         self.redo.push(step.clone());
         Some(step)
@@ -78,6 +131,7 @@ impl History {
     /// first, as they are stored.
     pub fn redo(&mut self) -> Option<Step> {
         self.open = false;
+        self.group = 0;
         let step = self.redo.pop()?;
         self.undo.push(step.clone());
         Some(step)
@@ -111,6 +165,8 @@ impl History {
             undo,
             redo,
             open: false,
+            group: 0,
+            group_fresh: false,
         }
     }
 
@@ -216,6 +272,39 @@ mod tests {
         history.seal();
         history.push(typing(start + Duration::from_millis(10), 1..1, "b"));
         assert_eq!(history.undo_depth(), 2);
+    }
+
+    #[test]
+    fn a_group_joins_every_change_into_one_step() {
+        let start = EditTime::now();
+        let mut history = History::new();
+        history.push(typing(start, 0..0, "x"));
+        history.begin_group();
+        history.push(typing(start + Duration::from_secs(5), 1..1, "a"));
+        history.seal();
+        history.push(typing(start + Duration::from_secs(10), 2..2, "b"));
+        history.end_group();
+        history.push(typing(start + Duration::from_secs(10), 3..3, "c"));
+        assert_eq!(history.undo_depth(), 3);
+        let undone = history.undo().expect("a step");
+        assert_eq!(undone.transactions.len(), 1);
+        let undone = history.undo().expect("a step");
+        assert_eq!(undone.transactions.len(), 2);
+    }
+
+    #[test]
+    fn nested_groups_close_with_the_outermost() {
+        let start = EditTime::now();
+        let mut history = History::new();
+        history.begin_group();
+        history.begin_group();
+        history.push(typing(start, 0..0, "a"));
+        history.end_group();
+        assert!(history.in_group());
+        history.push(typing(start + Duration::from_secs(5), 1..1, "b"));
+        history.end_group();
+        assert!(!history.in_group());
+        assert_eq!(history.undo_depth(), 1);
     }
 
     #[test]

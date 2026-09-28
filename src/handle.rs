@@ -19,7 +19,9 @@ use crate::config::{CursorStyle, GutterMode};
 use crate::core::motion::{self, MotionContext};
 use crate::core::search::SearchDirection;
 use crate::core::selection::{Selection, Selections};
-use crate::core::{ChangeInfo, EditorState, Response, ScrollEffect, position, search, words};
+use crate::core::{
+    ChangeInfo, EditOptions, EditorState, Response, ScrollEffect, position, search, words,
+};
 use crate::decoration::{Decoration, GutterMark, GutterSource};
 use crate::document::{Document, ViewId};
 use crate::event::EditorEvent;
@@ -445,6 +447,28 @@ impl EditorHandle {
         self.ctx.element.repaint();
     }
 
+    /// Opens an undo group on the document. Every change until the matching
+    /// [`end_undo_group`](Self::end_undo_group) undoes as one step. Groups nest.
+    pub fn begin_undo_group(&self) {
+        self.ctx.document.state_mut().history.begin_group();
+    }
+
+    /// Closes an undo group. Closing the outermost group seals the step.
+    pub fn end_undo_group(&self) {
+        self.ctx.document.state_mut().history.end_group();
+    }
+
+    /// Replaces the options editing follows. They belong to the document, so every view of it
+    /// follows them.
+    pub fn set_edit_options(&self, options: EditOptions) {
+        self.ctx.document.state_mut().options = options;
+    }
+
+    /// The options editing follows.
+    pub fn edit_options(&self) -> EditOptions {
+        self.ctx.document.state().options.clone()
+    }
+
     /// Changes what the caret looks like — a vim layer's mode change.
     pub fn set_cursor_style(&self, style: CursorStyle) {
         self.ctx.shared.borrow_mut().config.cursor_style = style;
@@ -465,6 +489,11 @@ impl EditorHandle {
             shared.active = active;
         }
         self.ctx.element.repaint();
+    }
+
+    /// Says whether the view glides to a new place or jumps there.
+    pub fn set_smooth_scroll(&self, smooth: bool) {
+        self.ctx.shared.borrow_mut().config.smooth_scroll = smooth;
     }
 
     /// Changes how the gutter numbers its lines.
@@ -929,14 +958,25 @@ impl EditorHandle {
         }
     }
 
+    /// Moves the view `lines` further: gliding when the editor scrolls smoothly, snapping
+    /// otherwise.
+    fn shift(&self, shared: &mut EditorShared, lines: f64, total: usize, viewport: f64) {
+        if shared.config.smooth_scroll {
+            shared.scroll.scroll_by(lines, total, viewport);
+        } else {
+            let line = shared.scroll.target_line + lines;
+            shared.scroll.scroll_to(line, total, viewport);
+        }
+    }
+
     /// Applies an explicit scroll command.
     fn apply_scroll(&self, shared: &mut EditorShared, command: ScrollCmd) {
         let total = shared.line_count();
         let viewport = shared.viewport_lines();
         let caret_line = position::line_of(&shared.rope(), shared.selections.primary().head) as f64;
         match command {
-            ScrollCmd::Lines(lines) => shared.scroll.scroll_by(lines, total, viewport),
-            ScrollCmd::Pages(pages) => shared.scroll.scroll_by(pages * viewport, total, viewport),
+            ScrollCmd::Lines(lines) => self.shift(shared, lines, total, viewport),
+            ScrollCmd::Pages(pages) => self.shift(shared, pages * viewport, total, viewport),
             ScrollCmd::ToLine(line) => shared.scroll.scroll_to(line as f64, total, viewport),
             ScrollCmd::CursorCenter => {
                 self.aim(shared, caret_line - viewport / 2.0, total, viewport)

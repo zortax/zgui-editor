@@ -36,6 +36,8 @@ pub struct EditOptions {
     pub indent: String,
     /// Whether the buffer refuses changes.
     pub read_only: bool,
+    /// Whether the Tab key inserts a tab character. It inserts [`indent`](Self::indent) otherwise.
+    pub hard_tabs: bool,
 }
 
 impl Default for EditOptions {
@@ -44,6 +46,7 @@ impl Default for EditOptions {
             auto_indent: true,
             indent: "    ".to_string(),
             read_only: false,
+            hard_tabs: false,
         }
     }
 }
@@ -398,6 +401,20 @@ impl EditorState<'_> {
             Command::ReplaceRanges(replacements) => {
                 self.edit(replacements.clone(), EditKind::Other, None)
             }
+            Command::Edit {
+                replacements,
+                selections,
+                primary,
+                kind,
+            } => self.edit_and_select(replacements.clone(), selections.as_deref(), *primary, *kind),
+            Command::InsertIndent => {
+                let unit = if self.doc.options.hard_tabs {
+                    "\t".to_string()
+                } else {
+                    self.doc.options.indent.clone()
+                };
+                self.replace_selections(|_, _| unit.clone(), EditKind::Typing)
+            }
             Command::IndentLines { dedent } => self.indent(*dedent),
             Command::Undo => self.undo(),
             Command::Redo => self.redo(),
@@ -492,6 +509,48 @@ impl EditorState<'_> {
             return Response::nothing();
         }
         self.replace(replacements, kind, carets, true)
+    }
+
+    /// Applies `replacements` as one recorded transaction and puts the selections at `selections`,
+    /// which address the changed text.
+    fn edit_and_select(
+        &mut self,
+        replacements: Vec<(Range<usize>, String)>,
+        selections: Option<&[Selection]>,
+        primary: usize,
+        kind: EditKind,
+    ) -> Response {
+        if self.doc.options.read_only {
+            return Response::nothing();
+        }
+        let only_selects = replacements
+            .iter()
+            .all(|(range, text)| range.start == range.end && text.is_empty());
+        let mut response = if only_selects {
+            Response::nothing()
+        } else {
+            self.replace(replacements, kind, None, true)
+        };
+        if let Some(selections) = selections.filter(|selections| !selections.is_empty()) {
+            let rope = self.doc.buffer.rope().clone();
+            let snapped: Vec<Selection> = selections
+                .iter()
+                .map(|selection| Selection {
+                    anchor: position::snap(&rope, selection.anchor),
+                    head: position::snap(&rope, selection.head),
+                    ..*selection
+                })
+                .collect();
+            self.selections.set(snapped, primary);
+            if response.change.is_some() {
+                self.doc.history.amend_after(self.selections.clone());
+            } else {
+                self.doc.history.seal();
+            }
+            response.selection_changed = true;
+            response.scroll = Some(ScrollEffect::EnsureVisible);
+        }
+        response
     }
 
     /// Applies `replacements` as one transaction and moves the selections. `record` says whether

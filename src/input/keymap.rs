@@ -54,7 +54,7 @@ pub fn default_keymap(event: &KeyEvent, modifiers: Modifiers) -> Option<Command>
             NamedKey::Tab if modifiers.shift() => {
                 return Some(Command::IndentLines { dedent: true });
             }
-            NamedKey::Tab => return Some(Command::Insert("\t".to_string())),
+            NamedKey::Tab => return Some(Command::InsertIndent),
             NamedKey::Copy => return Some(Command::Copy(Clipboard::Standard)),
             NamedKey::Cut => return Some(Command::Cut(Clipboard::Standard)),
             NamedKey::Paste => return Some(Command::Paste(Clipboard::Standard)),

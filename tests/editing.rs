@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use zgui::prelude::*;
 use zgui::vocab::{Key, NamedKey};
-use zgui_editor::{Command, EditorHandle, Motion};
+use zgui_editor::{Command, EditKind, EditOptions, EditorHandle, Motion, Selection};
 use zgui_testkit_view::Window;
 
 /// The editor, mounted, with its handle and its focusable node.
@@ -173,4 +173,71 @@ fn the_revision_signal_follows_edits() {
     assert_eq!(revision.get_untracked(), 0);
     type_str(&mounted, "a");
     assert_eq!(revision.get_untracked(), 1);
+}
+
+#[test]
+fn an_edit_places_its_own_carets_and_undoes_in_one_step() {
+    let mounted = mount("a", None);
+    mounted.handle.command(Command::Edit {
+        replacements: vec![(1..1, "{}".to_string())],
+        selections: Some(vec![Selection::caret(2)]),
+        primary: 0,
+        kind: EditKind::Typing,
+    });
+    mounted.window.frame();
+    assert_eq!(text_of(&mounted), "a{}");
+    let head = mounted
+        .handle
+        .query(|snapshot| snapshot.selections().primary().head);
+    assert_eq!(head, 2);
+    press_with(&mounted, Key::character("z"), Modifiers::CONTROL);
+    assert_eq!(text_of(&mounted), "a");
+}
+
+#[test]
+fn tab_inserts_the_indent_unless_tabs_are_hard() {
+    let mounted = mount("", None);
+    let options = mounted.handle.edit_options();
+    mounted.handle.set_edit_options(EditOptions {
+        indent: "  ".to_string(),
+        ..options.clone()
+    });
+    press(&mounted, Key::Named(NamedKey::Tab));
+    assert_eq!(text_of(&mounted), "  ");
+    mounted.handle.set_edit_options(EditOptions {
+        hard_tabs: true,
+        ..options
+    });
+    press(&mounted, Key::Named(NamedKey::Tab));
+    assert_eq!(text_of(&mounted), "  \t");
+}
+
+#[test]
+fn an_undo_group_undoes_every_change_inside_it_at_once() {
+    let mounted = mount("", None);
+    mounted.handle.begin_undo_group();
+    type_str(&mounted, "ab");
+    press(&mounted, Key::Named(NamedKey::Enter));
+    mounted.handle.command(Command::Move {
+        motion: Motion::Left,
+        count: 1,
+        extend: false,
+    });
+    type_str(&mounted, "c");
+    mounted.handle.end_undo_group();
+    type_str(&mounted, "d");
+    press_with(&mounted, Key::character("z"), Modifiers::CONTROL);
+    press_with(&mounted, Key::character("z"), Modifiers::CONTROL);
+    assert_eq!(text_of(&mounted), "");
+}
+
+#[test]
+fn read_only_options_refuse_edits_after_mount() {
+    let mounted = mount("x", None);
+    mounted.handle.set_edit_options(EditOptions {
+        read_only: true,
+        ..mounted.handle.edit_options()
+    });
+    type_str(&mounted, "y");
+    assert_eq!(text_of(&mounted), "x");
 }
