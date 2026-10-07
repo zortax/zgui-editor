@@ -15,7 +15,7 @@ use zgui::prelude::*;
 use zgui::runtime::clipboard::Clipboards;
 
 use crate::command::{Clipboard, Command, InsertPoint, Motion, ScrollCmd};
-use crate::config::{CursorStyle, GutterMode};
+use crate::config::{CopyTarget, CursorStyle, GutterMode, PasteSource};
 use crate::core::motion::{self, MotionContext};
 use crate::core::search::SearchDirection;
 use crate::core::selection::{Selection, Selections};
@@ -275,6 +275,46 @@ impl EditorHandle {
                 start_glide: RefCell::new(None),
                 registry,
             }),
+        }
+    }
+
+    /// Puts `text` where the copies of this editor go: the desktop's `clipboard`, or the
+    /// editor's own copy of that kind. A modal layer that yanks into a clipboard register copies
+    /// through here, so its copies follow the same rule as the editor's.
+    pub fn copy_text(&self, clipboard: Clipboard, text: String) {
+        let target = self.ctx.shared.borrow().config.copy_to;
+        match (target, self.ctx.clipboards.as_ref()) {
+            (CopyTarget::Desktop, Some(clipboards)) => {
+                clipboards.set_text(kind_of(clipboard), text);
+            }
+            _ => self.ctx.own.borrow_mut()[own_slot(clipboard)] = Some(text),
+        }
+    }
+
+    /// Reads where the pastes of this editor read from, and calls `then` with what is there: the
+    /// editor's own copy while one stands and pastes may take it, else the desktop's `clipboard`.
+    /// An editor away from a desktop answers its own copy.
+    pub fn read_clipboard(
+        &self,
+        clipboard: Clipboard,
+        then: impl FnOnce(Option<String>) + 'static,
+    ) {
+        let source = self.ctx.shared.borrow().config.paste_from;
+        let own = self.ctx.own.borrow()[own_slot(clipboard)].clone();
+        match (source, own, self.ctx.clipboards.as_ref()) {
+            (PasteSource::OwnThenDesktop, Some(text), _) | (_, Some(text), None) => {
+                then(Some(text))
+            }
+            (_, None, None) => then(None),
+            (_, _, Some(clipboards)) => clipboards.read_text(kind_of(clipboard), then),
+        }
+    }
+
+    /// Lets go of the editor's own copies, where pastes read them only while the editor has the
+    /// focus.
+    pub fn forget_own_copies(&self) {
+        if self.ctx.shared.borrow().config.paste_from == PasteSource::OwnThenDesktop {
+            *self.ctx.own.borrow_mut() = [None, None];
         }
     }
 
@@ -869,30 +909,13 @@ impl EditorHandle {
             start();
         }
 
-        // The clipboard, and the paste that comes back through a command. Without the desktop's
-        // clipboards, the editor's own hold the copy.
+        // The clipboard, and the paste that comes back through a command.
         if let Some((clipboard, text)) = response.copied {
-            match self.ctx.clipboards.as_ref() {
-                Some(clipboards) => clipboards.set_text(kind_of(clipboard), text),
-                None => self.ctx.own.borrow_mut()[own_slot(clipboard)] = Some(text),
-            }
+            self.copy_text(clipboard, text);
         }
-        if let Some(clipboard) = response.paste_requested
-            && self.ctx.clipboards.is_none()
-        {
-            let held = self.ctx.own.borrow()[own_slot(clipboard)].clone();
-            if let Some(text) = held.filter(|text| !text.is_empty()) {
-                self.command(Command::InsertAt {
-                    at: InsertPoint::AtCarets,
-                    text,
-                    linewise: false,
-                });
-            }
-        } else if let Some(clipboard) = response.paste_requested
-            && let Some(clipboards) = self.ctx.clipboards.as_ref()
-        {
+        if let Some(clipboard) = response.paste_requested {
             let handle = self.clone();
-            clipboards.read_text(kind_of(clipboard), move |text| {
+            self.read_clipboard(clipboard, move |text| {
                 if let Some(text) = text
                     && !text.is_empty()
                 {

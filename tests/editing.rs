@@ -260,3 +260,111 @@ fn an_editor_without_the_desktop_clipboard_pastes_its_own_copy() {
     mounted.window.frame();
     assert_eq!(text_of(&mounted), "secretsecret");
 }
+
+/// The editor over `text` built with `config`, on a window whose desktop clipboard is `clipboards`.
+fn mount_on_desktop(
+    text: &str,
+    config: zgui_editor::EditorConfig,
+    clipboards: zgui::runtime::clipboard::Clipboards,
+) -> Mounted {
+    let window = Window::open();
+    window.place(window.root, 0.0, 0.0, 800.0, 600.0);
+    let taken: Rc<RefCell<Option<EditorHandle>>> = Rc::new(RefCell::new(None));
+    let text = text.to_string();
+    let built = {
+        let taken = Rc::clone(&taken);
+        window.scope.with(|| {
+            zgui::reactive::provide_local_context(clipboards);
+            let view = view! {
+                Editor(
+                    text = text.clone(),
+                    config = config,
+                    autofocus = false,
+                    on_ready = Box::new(move |handle| {
+                        *taken.borrow_mut() = Some(handle);
+                    }) as Box<dyn Fn(EditorHandle)>,
+                )
+            };
+            use zgui::view::IntoView;
+            let mut built = view.into_view().build(&mut window.cx.cx());
+            built.mount(&window.dom_handle, window.root, None);
+            built
+        })
+    };
+    std::mem::forget(built);
+    window.frame();
+    let handle = taken.borrow_mut().take().expect("on_ready ran at build");
+    let node = window
+        .dom
+        .tree()
+        .children(window.root)
+        .into_iter()
+        .find(|child| !window.dom.tree().is_marker(*child))
+        .expect("the editor mounted one element");
+    Mounted {
+        window,
+        node,
+        handle,
+    }
+}
+
+/// How many requests the desktop clipboard holds that the loop has not carried out.
+fn queued(clipboards: &zgui::runtime::clipboard::Clipboards) -> String {
+    let shown = format!("{clipboards:?}");
+    shown
+        .split("queued: ")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+#[test]
+fn an_own_copy_never_reaches_the_desktop_and_a_paste_reads_it_until_the_focus_goes() {
+    let clipboards = zgui::runtime::clipboard::Clipboards::default();
+    let config = zgui_editor::EditorConfig {
+        copy_to: zgui_editor::CopyTarget::Own,
+        paste_from: zgui_editor::PasteSource::OwnThenDesktop,
+        ..zgui_editor::EditorConfig::default()
+    };
+    let mounted = mount_on_desktop("secret", config, clipboards.clone());
+    mounted.handle.command(Command::SelectAll);
+    mounted
+        .handle
+        .command(Command::Copy(zgui_editor::Clipboard::Standard));
+    assert_eq!(queued(&clipboards), "0", "the desktop saw nothing");
+    mounted.handle.command(Command::Move {
+        motion: Motion::DocumentEnd,
+        count: 1,
+        extend: false,
+    });
+    mounted
+        .handle
+        .command(Command::Paste(zgui_editor::Clipboard::Standard));
+    mounted.window.frame();
+    assert_eq!(text_of(&mounted), "secretsecret");
+    assert_eq!(queued(&clipboards), "0", "the paste read the own copy");
+
+    // Once the focus went, a paste reads the desktop, where a password manager put its text.
+    mounted.handle.forget_own_copies();
+    mounted
+        .handle
+        .command(Command::Paste(zgui_editor::Clipboard::Standard));
+    assert_eq!(queued(&clipboards), "1", "the paste asked the desktop");
+    assert_eq!(text_of(&mounted), "secretsecret");
+}
+
+#[test]
+fn a_desktop_copy_goes_to_the_desktop() {
+    let clipboards = zgui::runtime::clipboard::Clipboards::default();
+    let mounted = mount_on_desktop(
+        "open",
+        zgui_editor::EditorConfig::default(),
+        clipboards.clone(),
+    );
+    mounted.handle.command(Command::SelectAll);
+    mounted
+        .handle
+        .command(Command::Copy(zgui_editor::Clipboard::Standard));
+    assert_eq!(queued(&clipboards), "1");
+}

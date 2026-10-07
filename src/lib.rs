@@ -76,7 +76,7 @@ pub mod syntax;
 mod view;
 
 pub use crate::command::{Clipboard, Command, InsertPoint, Motion, ScrollCmd};
-pub use crate::config::{ClipboardScope, CursorStyle, EditorConfig, GutterMode};
+pub use crate::config::{CopyTarget, CursorStyle, EditorConfig, GutterMode, PasteSource};
 pub use crate::core::edit::{Edit, EditKind, EditTime, TextChange, Transaction};
 pub use crate::core::history::{History, Step};
 pub use crate::core::search::SearchDirection;

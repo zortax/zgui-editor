@@ -6,7 +6,7 @@
 use std::ops::Range;
 
 use crate::core::position;
-use crate::render::shaping::ShapedLine;
+use crate::render::shaping::{ShapedLine, TabMap};
 use zgui::canvas::zgui_color::Color;
 
 /// The parts of `line` that `concealed` covers, as byte ranges of the shaped (tab-expanded) line.
@@ -21,14 +21,36 @@ pub fn on_line(
     }
     let start = position::line_start(rope, line);
     let end = position::line_end(rope, line);
-    concealed
+    let ranges: Vec<Range<usize>> = concealed
         .iter()
-        .filter(|(range, _, _)| range.start < end && range.end > start)
-        .map(|(range, _, _)| {
-            let from = (range.start.max(start) - start) as u32;
-            let to = (range.end.min(end) - start) as u32;
-            shaped.tab_map.to_expanded(from)..shaped.tab_map.to_expanded(to)
+        .map(|(range, _, _)| range.clone())
+        .collect();
+    expanded(start..end, &ranges, &shaped.tab_map)
+}
+
+/// The parts of the line at `line` (buffer bytes) that `ranges` cover, as byte ranges of the
+/// line once `tabs` expanded it.
+pub fn expanded(line: Range<usize>, ranges: &[Range<usize>], tabs: &TabMap) -> Vec<Range<u32>> {
+    ranges
+        .iter()
+        .filter(|range| range.start < line.end && range.end > line.start)
+        .map(|range| {
+            let from = (range.start.max(line.start) - line.start) as u32;
+            let to = (range.end.min(line.end) - line.start) as u32;
+            tabs.to_expanded(from)..tabs.to_expanded(to)
         })
+        .collect()
+}
+
+/// Where in `text`, a line starting at buffer byte `start`, the characters `range` covers
+/// start, as bytes of the line. Each one takes one mark; a line break takes none.
+pub fn marked(text: &str, start: usize, range: &Range<usize>) -> Vec<usize> {
+    text.char_indices()
+        .filter(|(local, character)| {
+            let byte = start + local;
+            byte >= range.start && byte < range.end && *character != '\n' && *character != '\r'
+        })
+        .map(|(local, _)| local)
         .collect()
 }
 
@@ -61,7 +83,31 @@ pub fn shown(clusters: &[u32], glyphs: Range<u32>, hidden: &[Range<u32>]) -> Vec
 
 #[cfg(test)]
 mod tests {
-    use super::shown;
+    use super::{expanded, marked, shown};
+    use crate::render::shaping::expand_tabs;
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn a_tab_before_the_value_moves_the_hidden_glyphs_with_it() {
+        // `a\tb: pw`, tab stops of four: the value starts at byte 5 and at column 7.
+        let (_, tabs) = expand_tabs("a\tb: pw", 4);
+        assert_eq!(expanded(10..18, &[15..17], &tabs), vec![7..9]);
+        assert_eq!(
+            expanded(10..18, &[0..9], &tabs),
+            Vec::<std::ops::Range<u32>>::new()
+        );
+    }
+
+    #[test]
+    fn every_character_takes_one_mark_whatever_its_bytes() {
+        let text = "pw: pässwört";
+        let value = 4..text.len();
+        let marks = marked(text, 0, &value);
+        assert_eq!(marks.len(), "pässwört".chars().count());
+        assert_eq!(marks[..3], [4, 5, 7]);
+        // A range that starts on a later line counts in bytes of the buffer.
+        assert_eq!(marked("ab", 10, &(11..12)), [1]);
+    }
 
     #[test]
     #[allow(clippy::single_range_in_vec_init)]

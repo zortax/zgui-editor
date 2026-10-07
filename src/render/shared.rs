@@ -1184,12 +1184,7 @@ impl EditorShared {
                 return;
             };
             let shaped = self.shaping.shape(shaper, &self.families, &mark, &metrics);
-            for (local, character) in text.char_indices() {
-                let byte = start + local;
-                if byte < range.start || byte >= range.end || character == '\n' || character == '\r'
-                {
-                    continue;
-                }
+            for local in conceal::marked(&text, start, range) {
                 let x = line_cache::caret_x(&cached.shaped, local as u32);
                 let at = Point::new(DevicePx(text_x0 + x), DevicePx(y));
                 for run in shaped.runs.iter() {

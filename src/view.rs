@@ -117,11 +117,7 @@ pub fn Editor(
     let (element_view, element_handle) =
         zgui::custom::custom(EditorElement::new(Rc::clone(&shared)));
     let port = NodeRef::new();
-    // An editor that keeps its copies to itself never reaches the desktop's clipboards.
-    let clipboards = match config.clipboard {
-        crate::config::ClipboardScope::Desktop => try_use_clipboard(),
-        crate::config::ClipboardScope::Own => None,
-    };
+    let clipboards = try_use_clipboard();
 
     let registry =
         registry.unwrap_or_else(|| crate::syntax::registry::LanguageRegistry::new().with_bundled());
@@ -441,20 +437,18 @@ pub fn Editor(
                         selections: vec![Selection::caret(byte)],
                         primary: 0,
                     });
-                    if let Some(clipboards) = handle.ctx.clipboards.as_ref() {
-                        let handle = handle.clone();
-                        clipboards.read_text(ClipboardKind::Primary, move |text| {
-                            if let Some(text) = text
-                                && !text.is_empty()
-                            {
-                                handle.command(Command::InsertAt {
-                                    at: InsertPoint::AtCarets,
-                                    text,
-                                    linewise: false,
-                                });
-                            }
-                        });
-                    }
+                    let inserting = handle.clone();
+                    handle.read_clipboard(Clipboard::Primary, move |text| {
+                        if let Some(text) = text
+                            && !text.is_empty()
+                        {
+                            inserting.command(Command::InsertAt {
+                                at: InsertPoint::AtCarets,
+                                text,
+                                linewise: false,
+                            });
+                        }
+                    });
                     return;
                 }
                 _ => {}
@@ -772,6 +766,7 @@ pub fn Editor(
             }
             blink.borrow_mut().take();
             handle.ctx.element.repaint();
+            handle.forget_own_copies();
             if let Some(tell) = handle.ctx.on_event.borrow().as_ref() {
                 tell(EditorEvent::Blurred);
             }

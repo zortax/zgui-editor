@@ -37,16 +37,27 @@ pub enum CursorStyle {
     Hollow,
 }
 
-/// Where the copies and pastes of an editor go.
+/// Where the copies of an editor go.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum ClipboardScope {
+pub enum CopyTarget {
     /// The clipboards of the desktop.
     #[default]
     Desktop,
-    /// A clipboard of the editor's own, one per kind: a copy lands there, a paste reads it, and
-    /// the desktop never sees the text. What an editor over values that must not leave it, such
-    /// as passwords, asks for.
+    /// A clipboard of the editor's own, one per kind. The desktop never sees the text. What an
+    /// editor over values that must not leave it, such as passwords, asks for.
     Own,
+}
+
+/// Where the pastes of an editor read from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PasteSource {
+    /// The clipboards of the desktop.
+    #[default]
+    Desktop,
+    /// The editor's own copy, while one stands, and the desktop's clipboard otherwise. The own
+    /// copy goes when the editor loses the focus, so a paste after a visit to another program,
+    /// such as a password manager, reads what that program put on the desktop.
+    OwnThenDesktop,
 }
 
 /// The behaviour an editor is built with.
@@ -81,8 +92,10 @@ pub struct EditorConfig {
     /// Whether the selection is copied to the primary selection on mouse release, where the
     /// platform has one.
     pub copy_on_select: bool,
-    /// Where copies and pastes go.
-    pub clipboard: ClipboardScope,
+    /// Where copies go.
+    pub copy_to: CopyTarget,
+    /// Where pastes read from.
+    pub paste_from: PasteSource,
     /// Which lines the view draws, when it draws only some of them.
     ///
     /// A window turns one editor into a view of one part of a document: it draws exactly these
@@ -113,7 +126,8 @@ impl Default for EditorConfig {
             scrolloff: 0,
             edit: EditOptions::default(),
             copy_on_select: true,
-            clipboard: ClipboardScope::Desktop,
+            copy_to: CopyTarget::Desktop,
+            paste_from: PasteSource::Desktop,
             line_window: None,
             focus_on_secondary: true,
         }
