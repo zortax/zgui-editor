@@ -384,7 +384,10 @@ pub fn Editor(
             let Some((x, y)) = local_point(cx.position) else {
                 return;
             };
-            if focusable {
+            // A secondary press takes the focus unless the config leaves it where it is, for a
+            // menu an ancestor opens over the editor.
+            let secondary = cx.button == Some(PointerButton::Secondary);
+            if focusable && (!secondary || shared.borrow().config.focus_on_secondary) {
                 cx.request_focus(cx.current);
                 port.focus();
             }
