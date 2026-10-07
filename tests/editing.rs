@@ -241,3 +241,22 @@ fn read_only_options_refuse_edits_after_mount() {
     type_str(&mounted, "y");
     assert_eq!(text_of(&mounted), "x");
 }
+
+#[test]
+fn an_editor_without_the_desktop_clipboard_pastes_its_own_copy() {
+    let mounted = mount("secret", None);
+    mounted.handle.command(Command::SelectAll);
+    mounted
+        .handle
+        .command(Command::Copy(zgui_editor::Clipboard::Standard));
+    mounted.handle.command(Command::Move {
+        motion: Motion::DocumentEnd,
+        count: 1,
+        extend: false,
+    });
+    mounted
+        .handle
+        .command(Command::Paste(zgui_editor::Clipboard::Standard));
+    mounted.window.frame();
+    assert_eq!(text_of(&mounted), "secretsecret");
+}

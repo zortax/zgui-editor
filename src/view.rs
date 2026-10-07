@@ -117,7 +117,11 @@ pub fn Editor(
     let (element_view, element_handle) =
         zgui::custom::custom(EditorElement::new(Rc::clone(&shared)));
     let port = NodeRef::new();
-    let clipboards = try_use_clipboard();
+    // An editor that keeps its copies to itself never reaches the desktop's clipboards.
+    let clipboards = match config.clipboard {
+        crate::config::ClipboardScope::Desktop => try_use_clipboard(),
+        crate::config::ClipboardScope::Own => None,
+    };
 
     let registry =
         registry.unwrap_or_else(|| crate::syntax::registry::LanguageRegistry::new().with_bundled());

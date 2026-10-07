@@ -33,7 +33,7 @@ use crate::render::line_cache::{self, CachedLine, LineCache};
 use crate::render::metrics::TextMetrics;
 use crate::render::shaping::ShapingCache;
 use crate::render::theme::{self, Theme};
-use crate::render::{families, gutter};
+use crate::render::{conceal, families, gutter};
 use crate::scroll::{ScrollState, Scrollbar};
 use crate::styles::StyleState;
 use crate::syntax::SyntaxState;
@@ -895,31 +895,36 @@ impl EditorShared {
         // The marks beside the numbers.
         self.paint_gutter_marks(painter, &visible);
 
-        // The text.
+        // The text, with the concealed characters left out and their marks drawn in place.
+        let concealed = self.concealed(&visible);
         for line in visible.clone() {
             let Some(cached) = self.ensure_line(line) else {
                 continue;
             };
             let y = self.line_y(line) + metrics.baseline - metrics.ascent;
             let origin = Point::new(DevicePx(text_x0), DevicePx(y));
+            let hidden = conceal::on_line(&rope, line, &concealed, &cached.shaped);
             for slice in &cached.slices {
                 let run = &cached.shaped.runs[slice.run as usize];
-                let borrowed = ShapedRun {
-                    glyphs: &run.glyphs[slice.glyphs.start as usize..slice.glyphs.end as usize],
-                    synthetic_bold: if slice.bold {
-                        run.synthetic_bold.max(SYNTHETIC_BOLD)
-                    } else {
-                        run.synthetic_bold
-                    },
-                    synthetic_slant: if slice.italic && run.synthetic_slant == 0.0 {
-                        SYNTHETIC_SLANT
-                    } else {
-                        run.synthetic_slant
-                    },
-                    ..run.as_run(PaintSlot(0))
-                };
-                painter.glyphs(&borrowed, origin, slice.color);
+                for glyphs in conceal::shown(&run.clusters, slice.glyphs.clone(), &hidden) {
+                    let borrowed = ShapedRun {
+                        glyphs: &run.glyphs[glyphs],
+                        synthetic_bold: if slice.bold {
+                            run.synthetic_bold.max(SYNTHETIC_BOLD)
+                        } else {
+                            run.synthetic_bold
+                        },
+                        synthetic_slant: if slice.italic && run.synthetic_slant == 0.0 {
+                            SYNTHETIC_SLANT
+                        } else {
+                            run.synthetic_slant
+                        },
+                        ..run.as_run(PaintSlot(0))
+                    };
+                    painter.glyphs(&borrowed, origin, slice.color);
+                }
             }
+            self.paint_conceal_marks(painter, &rope, line, &concealed, text_x0, y);
         }
 
         // The lines under the text, over it so a descender never hides an error.
@@ -1026,7 +1031,7 @@ impl EditorShared {
                         fill(painter, 0.0, y, bar, line_height, color);
                     }
                 }
-                DecorationKind::Underline { .. } => {}
+                DecorationKind::Underline { .. } | DecorationKind::Conceal { .. } => {}
             }
         }
 
@@ -1132,6 +1137,68 @@ impl EditorShared {
         }
     }
 
+    /// The concealed ranges over the lines of `visible`, with the mark and the colour of each.
+    fn concealed(&self, visible: &Range<usize>) -> Vec<(Range<usize>, char, Color)> {
+        if self.decorations.is_empty() {
+            return Vec::new();
+        }
+        let bytes = self.visible_bytes(visible);
+        self.decorations
+            .overlapping(bytes)
+            .filter(|decoration| !decoration.range.is_empty())
+            .filter_map(|decoration| match &decoration.kind {
+                DecorationKind::Conceal { with, paint } => {
+                    Some((decoration.range.clone(), *with, self.paint_color(paint)))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Draws the mark of every concealed character of `line`, where the character starts.
+    fn paint_conceal_marks(
+        &mut self,
+        painter: &mut ScenePainter<'_>,
+        rope: &ropey::Rope,
+        line: usize,
+        concealed: &[(Range<usize>, char, Color)],
+        text_x0: f32,
+        y: f32,
+    ) {
+        if concealed.is_empty() {
+            return;
+        }
+        let start = position::line_start(rope, line);
+        let end = position::line_end(rope, line);
+        let text = position::line_text(rope, line);
+        let metrics = self.metrics;
+        for (range, with, color) in concealed {
+            if range.end <= start || range.start >= end {
+                continue;
+            }
+            let Some(cached) = self.ensure_line(line) else {
+                return;
+            };
+            let mark = with.to_string();
+            let Some(shaper) = self.shaper.as_mut() else {
+                return;
+            };
+            let shaped = self.shaping.shape(shaper, &self.families, &mark, &metrics);
+            for (local, character) in text.char_indices() {
+                let byte = start + local;
+                if byte < range.start || byte >= range.end || character == '\n' || character == '\r'
+                {
+                    continue;
+                }
+                let x = line_cache::caret_x(&cached.shaped, local as u32);
+                let at = Point::new(DevicePx(text_x0 + x), DevicePx(y));
+                for run in shaped.runs.iter() {
+                    painter.glyphs(&run.as_run(PaintSlot(0)), at, *color);
+                }
+            }
+        }
+    }
+
     /// Draws the lines an application asked for under the text.
     fn paint_decoration_underlines(
         &mut self,
@@ -1156,7 +1223,8 @@ impl EditorShared {
                 }
                 DecorationKind::Background(_)
                 | DecorationKind::LineBackground(_)
-                | DecorationKind::LineBar(_) => None,
+                | DecorationKind::LineBar(_)
+                | DecorationKind::Conceal { .. } => None,
             })
             .collect();
 

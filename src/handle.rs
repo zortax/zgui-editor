@@ -219,6 +219,8 @@ pub(crate) struct EditorCtx {
     pub element: zgui::custom::CustomHandle<EditorElement>,
     pub port: NodeRef,
     pub clipboards: Option<Clipboards>,
+    /// The editor's own clipboards, standard then primary: where copies go without the desktop's.
+    pub own: RefCell<[Option<String>; 2]>,
     pub on_event: RefCell<EventReporter>,
     pub signals: HandleSignals,
     /// Starts the scroll glide's timer; set by the view, which owns the timers.
@@ -267,6 +269,7 @@ impl EditorHandle {
                 element,
                 port,
                 clipboards,
+                own: RefCell::new([None, None]),
                 on_event: RefCell::new(on_event),
                 signals: HandleSignals::new(),
                 start_glide: RefCell::new(None),
@@ -866,13 +869,26 @@ impl EditorHandle {
             start();
         }
 
-        // The clipboard, and the paste that comes back through a command.
-        if let Some((clipboard, text)) = response.copied
-            && let Some(clipboards) = self.ctx.clipboards.as_ref()
-        {
-            clipboards.set_text(kind_of(clipboard), text);
+        // The clipboard, and the paste that comes back through a command. Without the desktop's
+        // clipboards, the editor's own hold the copy.
+        if let Some((clipboard, text)) = response.copied {
+            match self.ctx.clipboards.as_ref() {
+                Some(clipboards) => clipboards.set_text(kind_of(clipboard), text),
+                None => self.ctx.own.borrow_mut()[own_slot(clipboard)] = Some(text),
+            }
         }
         if let Some(clipboard) = response.paste_requested
+            && self.ctx.clipboards.is_none()
+        {
+            let held = self.ctx.own.borrow()[own_slot(clipboard)].clone();
+            if let Some(text) = held.filter(|text| !text.is_empty()) {
+                self.command(Command::InsertAt {
+                    at: InsertPoint::AtCarets,
+                    text,
+                    linewise: false,
+                });
+            }
+        } else if let Some(clipboard) = response.paste_requested
             && let Some(clipboards) = self.ctx.clipboards.as_ref()
         {
             let handle = self.clone();
@@ -1101,6 +1117,14 @@ fn pin(shared: &mut EditorShared, change: &ChangeInfo, top: f64) {
     shared.scroll.scroll_to(top + moved, total, viewport);
     shared.scroll.target_line =
         target.clamp(0.0, crate::scroll::ScrollState::max_top(total, viewport));
+}
+
+/// Where the editor's own clipboard of `clipboard` sits.
+fn own_slot(clipboard: Clipboard) -> usize {
+    match clipboard {
+        Clipboard::Standard => 0,
+        Clipboard::Primary => 1,
+    }
 }
 
 /// The framework's name for one of ours.

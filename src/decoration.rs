@@ -100,6 +100,18 @@ pub enum DecorationKind {
     /// Two device pixels wide, over the gutter's own background. What marks a run of lines as
     /// one thing without tinting them.
     LineBar(Paint),
+    /// One mark in place of every character of the range: `with`, drawn in `paint` where the
+    /// character starts.
+    ///
+    /// Only the drawing changes. The text, the carets, the selection and every command keep the
+    /// characters beneath, so concealed text still edits and copies as it is. Line breaks stay
+    /// line breaks. What hides values from a shared screen.
+    Conceal {
+        /// The character drawn in place of each one.
+        with: char,
+        /// What it is drawn with.
+        paint: Paint,
+    },
 }
 
 impl DecorationKind {
@@ -109,7 +121,8 @@ impl DecorationKind {
             Self::Background(paint)
             | Self::LineBackground(paint)
             | Self::LineBar(paint)
-            | Self::Underline { paint, .. } => paint,
+            | Self::Underline { paint, .. }
+            | Self::Conceal { paint, .. } => paint,
         }
     }
 }
@@ -156,6 +169,17 @@ impl Decoration {
         Self {
             range,
             kind: DecorationKind::LineBar(paint.into()),
+        }
+    }
+
+    /// `with` drawn in place of every character of `range`.
+    pub fn conceal(range: Range<usize>, with: char, paint: impl Into<Paint>) -> Self {
+        Self {
+            range,
+            kind: DecorationKind::Conceal {
+                with,
+                paint: paint.into(),
+            },
         }
     }
 }

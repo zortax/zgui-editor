@@ -1,5 +1,6 @@
 //! Drawing the editor: metrics, theme, caches, and the element that paints them.
 
+pub mod conceal;
 pub mod element;
 pub mod families;
 pub mod gutter;

@@ -37,6 +37,18 @@ pub enum CursorStyle {
     Hollow,
 }
 
+/// Where the copies and pastes of an editor go.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ClipboardScope {
+    /// The clipboards of the desktop.
+    #[default]
+    Desktop,
+    /// A clipboard of the editor's own, one per kind: a copy lands there, a paste reads it, and
+    /// the desktop never sees the text. What an editor over values that must not leave it, such
+    /// as passwords, asks for.
+    Own,
+}
+
 /// The behaviour an editor is built with.
 #[derive(Clone, Debug)]
 pub struct EditorConfig {
@@ -69,6 +81,8 @@ pub struct EditorConfig {
     /// Whether the selection is copied to the primary selection on mouse release, where the
     /// platform has one.
     pub copy_on_select: bool,
+    /// Where copies and pastes go.
+    pub clipboard: ClipboardScope,
     /// Which lines the view draws, when it draws only some of them.
     ///
     /// A window turns one editor into a view of one part of a document: it draws exactly these
@@ -94,6 +108,7 @@ impl Default for EditorConfig {
             scrolloff: 0,
             edit: EditOptions::default(),
             copy_on_select: true,
+            clipboard: ClipboardScope::Desktop,
             line_window: None,
         }
     }
