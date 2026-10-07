@@ -93,6 +93,11 @@ pub struct EditorConfig {
     /// What a rendered document puts a real editor over one block with, and what a preview shows
     /// a hit in its own place with. `None` draws the whole document, which is the usual thing.
     pub line_window: Option<std::ops::Range<usize>>,
+    /// Whether a secondary press takes the focus, as every other press does.
+    ///
+    /// On by default. Off for a view that opens a menu of its own on a secondary press and wants
+    /// the keyboard to stay where it was while that menu stands.
+    pub focus_on_secondary: bool,
 }
 
 impl Default for EditorConfig {
@@ -110,6 +115,7 @@ impl Default for EditorConfig {
             copy_on_select: true,
             clipboard: ClipboardScope::Desktop,
             line_window: None,
+            focus_on_secondary: true,
         }
     }
 }
