@@ -130,6 +130,13 @@ pub struct EditorShared {
     pub on_style: Option<Rc<dyn Fn(StyleReport)>>,
     /// What was last reported, so the same answer is reported once.
     reported: Option<StyleReport>,
+    /// The style and the capture names the theme and the mark colours were last read with.
+    ///
+    /// A style the engine did not restyle is the same allocation from one layout to the next, so
+    /// a layout over it skips the colour parsing.
+    read_from: Option<(ComputedStyle, Vec<String>)>,
+    /// How often the theme and the mark colours were read off a style.
+    style_reads: u64,
 }
 
 impl EditorShared {
@@ -165,6 +172,8 @@ impl EditorShared {
             max_line_chars: None,
             on_style: None,
             reported: None,
+            read_from: None,
+            style_reads: 0,
         }
     }
 
@@ -448,13 +457,17 @@ impl EditorShared {
             self.max_line_width = 0.0;
         }
 
-        let theme = theme::from_style(style, self.syntax.capture_names());
-        if theme != self.theme {
-            self.syntax.resolve_colors(&theme);
-            self.theme = theme;
-            self.theme_version = self.theme_version.wrapping_add(1);
+        if !self.colours_read_from(style) {
+            let theme = theme::from_style(style, self.syntax.capture_names());
+            if theme != self.theme {
+                self.syntax.resolve_colors(&theme);
+                self.theme = theme;
+                self.theme_version = self.theme_version.wrapping_add(1);
+            }
+            self.resolve_decoration_colors(style);
+            self.read_from = Some((style.clone(), self.syntax.capture_names().to_vec()));
+            self.style_reads += 1;
         }
-        self.resolve_decoration_colors(style);
         self.resolve_looks();
 
         if !final_pass {
@@ -473,6 +486,24 @@ impl EditorShared {
                 tell(report);
             }
         }
+    }
+
+    /// Whether the theme and the mark colours already hold what `style` answers.
+    ///
+    /// True when `style` is the allocation they were read from, the capture names are the same,
+    /// and no mark names a property the last read did not look up.
+    fn colours_read_from(&self, style: &ComputedStyle) -> bool {
+        let Some((held, captures)) = &self.read_from else {
+            return false;
+        };
+        ComputedStyle::ptr_eq(held, style)
+            && captures.as_slice() == self.syntax.capture_names()
+            && !self.decorations_need_style()
+    }
+
+    /// How often the theme and the mark colours were read off a style.
+    pub fn style_reads(&self) -> u64 {
+        self.style_reads
     }
 
     /// Whether the styled family list is the one the current families were resolved from.
@@ -1601,6 +1632,38 @@ mod tests {
         let mut shared = EditorShared::new(Document::new(text), config, None);
         shared.viewport = (400.0, 20.0 * 20.0);
         shared
+    }
+
+    #[test]
+    fn a_layout_over_the_same_style_reads_no_colour_again() {
+        let mut shared = windowed("a\nb\n", None);
+        let style = zgui_css::StyleDraft::initial().build();
+        shared.read_style(&style, 1.0, (400.0, 400.0), true);
+        shared.read_style(&style, 1.0, (400.0, 400.0), true);
+        assert_eq!(shared.style_reads(), 1, "the second layout reuses the colours");
+
+        let restyled = zgui_css::StyleDraft::from_style(&style).build();
+        shared.read_style(&restyled, 1.0, (400.0, 400.0), true);
+        assert_eq!(shared.style_reads(), 2, "a new style is read");
+    }
+
+    #[test]
+    fn a_mark_that_names_a_new_property_reads_the_same_style_again() {
+        let mut shared = windowed("a\nb\n", None);
+        let style = zgui_css::StyleDraft::initial().build();
+        shared.read_style(&style, 1.0, (400.0, 400.0), true);
+        shared.decorations.set(
+            "search",
+            vec![crate::decoration::Decoration::background(0..1, "editor-search")],
+        );
+        assert!(shared.decorations_need_style());
+        shared.read_style(&style, 1.0, (400.0, 400.0), true);
+        assert_eq!(shared.style_reads(), 2);
+        assert!(
+            shared.decoration_colors.contains_key("editor-search"),
+            "the new property is looked up"
+        );
+        assert!(!shared.decorations_need_style());
     }
 
     #[test]
