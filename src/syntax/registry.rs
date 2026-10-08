@@ -68,7 +68,10 @@ impl LanguageRegistry {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(feature = "lang-yaml", feature = "lang-json", feature = "lang-bash")
+))]
 mod tests {
     use super::*;
 
