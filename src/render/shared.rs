@@ -136,6 +136,7 @@ pub struct EditorShared {
     /// a layout over it skips the colour parsing.
     read_from: Option<(ComputedStyle, Vec<String>)>,
     /// How often the theme and the mark colours were read off a style.
+    #[cfg(test)]
     style_reads: u64,
 }
 
@@ -173,6 +174,7 @@ impl EditorShared {
             on_style: None,
             reported: None,
             read_from: None,
+            #[cfg(test)]
             style_reads: 0,
         }
     }
@@ -466,7 +468,10 @@ impl EditorShared {
             }
             self.resolve_decoration_colors(style);
             self.read_from = Some((style.clone(), self.syntax.capture_names().to_vec()));
-            self.style_reads += 1;
+            #[cfg(test)]
+            {
+                self.style_reads += 1;
+            }
         }
         self.resolve_looks();
 
@@ -502,6 +507,7 @@ impl EditorShared {
     }
 
     /// How often the theme and the mark colours were read off a style.
+    #[cfg(test)]
     pub fn style_reads(&self) -> u64 {
         self.style_reads
     }
@@ -1640,11 +1646,39 @@ mod tests {
         let style = zgui_css::StyleDraft::initial().build();
         shared.read_style(&style, 1.0, (400.0, 400.0), true);
         shared.read_style(&style, 1.0, (400.0, 400.0), true);
-        assert_eq!(shared.style_reads(), 1, "the second layout reuses the colours");
+        assert_eq!(
+            shared.style_reads(),
+            1,
+            "the second layout reuses the colours"
+        );
 
         let restyled = zgui_css::StyleDraft::from_style(&style).build();
         shared.read_style(&restyled, 1.0, (400.0, 400.0), true);
         assert_eq!(shared.style_reads(), 2, "a new style is read");
+    }
+
+    #[test]
+    fn a_restyle_with_another_syntax_colour_moves_the_theme_version() {
+        let mut shared = windowed("a\nb\n", None);
+        let red = zgui_css::StyleDraft::initial()
+            .with_custom_property("syntax-keyword", "rgb(255, 0, 0)")
+            .build();
+        shared.read_style(&red, 1.0, (400.0, 400.0), true);
+        let first = shared.theme_version;
+        let same = zgui_css::StyleDraft::from_style(&red).build();
+        shared.read_style(&same, 1.0, (400.0, 400.0), true);
+        assert_eq!(
+            shared.theme_version, first,
+            "the same colours keep the version"
+        );
+        let blue = zgui_css::StyleDraft::initial()
+            .with_custom_property("syntax-keyword", "rgb(0, 0, 255)")
+            .build();
+        shared.read_style(&blue, 1.0, (400.0, 400.0), true);
+        assert_ne!(
+            shared.theme_version, first,
+            "a new keyword colour is a new theme"
+        );
     }
 
     #[test]
@@ -1654,7 +1688,10 @@ mod tests {
         shared.read_style(&style, 1.0, (400.0, 400.0), true);
         shared.decorations.set(
             "search",
-            vec![crate::decoration::Decoration::background(0..1, "editor-search")],
+            vec![crate::decoration::Decoration::background(
+                0..1,
+                "editor-search",
+            )],
         );
         assert!(shared.decorations_need_style());
         shared.read_style(&style, 1.0, (400.0, 400.0), true);
