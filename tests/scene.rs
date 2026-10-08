@@ -503,3 +503,26 @@ fn a_custom_gutter_is_as_wide_as_declared_and_asks_the_source_for_every_visible_
     lines.dedup();
     assert_eq!(lines, [0, 1, 2], "every visible line was asked for");
 }
+
+#[test]
+fn a_note_paints_nothing_into_the_text_and_clears_with_its_layer() {
+    // The headless harness shapes no glyphs, so the note's words are not in its scene. What it
+    // shows is that a note adds no band and no line, and leaves the text as it was.
+    let (mut harness, handle) = mounted("privileged: true\nimage: api\n");
+    let bare = quads_after(&mut harness, &handle);
+    handle.set_decorations(
+        "admission",
+        vec![zgui_editor::Decoration::note(
+            12..16,
+            "denied",
+            "editor-error",
+        )],
+    );
+    assert_eq!(quads_after(&mut harness, &handle), bare);
+    assert_eq!(
+        handle.query(|snapshot| snapshot.rope().to_string()),
+        "privileged: true\nimage: api\n"
+    );
+    handle.clear_decorations("admission");
+    assert_eq!(quads_after(&mut harness, &handle), bare);
+}

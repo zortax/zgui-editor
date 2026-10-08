@@ -112,6 +112,16 @@ pub enum DecorationKind {
         /// What it is drawn with.
         paint: Paint,
     },
+    /// A short text after the end of the line the range starts on, two cells clear of the text.
+    ///
+    /// Only the drawing changes: the note is no part of the text, takes no caret and widens no
+    /// line. Several notes on one line stand one after the other, in the order of their ranges.
+    Note {
+        /// What it says.
+        text: CompactString,
+        /// What it is drawn with.
+        paint: Paint,
+    },
 }
 
 impl DecorationKind {
@@ -122,7 +132,8 @@ impl DecorationKind {
             | Self::LineBackground(paint)
             | Self::LineBar(paint)
             | Self::Underline { paint, .. }
-            | Self::Conceal { paint, .. } => paint,
+            | Self::Conceal { paint, .. }
+            | Self::Note { paint, .. } => paint,
         }
     }
 }
@@ -169,6 +180,21 @@ impl Decoration {
         Self {
             range,
             kind: DecorationKind::LineBar(paint.into()),
+        }
+    }
+
+    /// `text` after the end of the line `range` starts on.
+    pub fn note(
+        range: Range<usize>,
+        text: impl Into<CompactString>,
+        paint: impl Into<Paint>,
+    ) -> Self {
+        Self {
+            range,
+            kind: DecorationKind::Note {
+                text: text.into(),
+                paint: paint.into(),
+            },
         }
     }
 
@@ -419,6 +445,16 @@ impl<T: Mark> Layers<T> {
 #[cfg(test)]
 mod tests {
     use super::{Decoration, GutterMark, Layers, Paint, UnderlineStyle};
+
+    #[test]
+    fn a_note_carries_its_words_and_its_paint() {
+        let note = Decoration::note(4..9, "denied by policy", "editor-error");
+        assert_eq!(note.kind.paint(), &Paint::from("editor-error"));
+        assert!(matches!(
+            &note.kind,
+            super::DecorationKind::Note { text, .. } if text == "denied by policy"
+        ));
+    }
 
     #[test]
     fn a_layer_replaces_only_itself() {

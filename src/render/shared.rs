@@ -927,6 +927,9 @@ impl EditorShared {
             self.paint_conceal_marks(painter, &rope, line, &concealed, text_x0, y);
         }
 
+        // The notes after the ends of their lines.
+        self.paint_notes(painter, &visible, text_x0);
+
         // The lines under the text, over it so a descender never hides an error.
         self.paint_decoration_underlines(painter, &visible, text_x0);
         self.paint_style_lines(painter, &visible, text_x0);
@@ -1031,7 +1034,9 @@ impl EditorShared {
                         fill(painter, 0.0, y, bar, line_height, color);
                     }
                 }
-                DecorationKind::Underline { .. } | DecorationKind::Conceal { .. } => {}
+                DecorationKind::Underline { .. }
+                | DecorationKind::Conceal { .. }
+                | DecorationKind::Note { .. } => {}
             }
         }
 
@@ -1194,6 +1199,54 @@ impl EditorShared {
         }
     }
 
+    /// Draws every note on screen after the end of its line, two cells clear of the text.
+    fn paint_notes(
+        &mut self,
+        painter: &mut ScenePainter<'_>,
+        visible: &Range<usize>,
+        text_x0: f32,
+    ) {
+        if self.decorations.is_empty() {
+            return;
+        }
+        let rope = self.rope();
+        let bytes = self.visible_bytes(visible);
+        let mut notes: Vec<(usize, CompactString, Color)> = self
+            .decorations
+            .overlapping(bytes)
+            .filter_map(|decoration| match &decoration.kind {
+                DecorationKind::Note { text, paint } if !text.is_empty() => {
+                    let line = position::line_of(&rope, decoration.range.start);
+                    Some((line, text.clone(), self.paint_color(paint)))
+                }
+                _ => None,
+            })
+            .filter(|(line, _, _)| visible.contains(line))
+            .collect();
+        notes.sort_by_key(|(line, _, _)| *line);
+        let metrics = self.metrics;
+        let mut last: Option<(usize, f32)> = None;
+        for (line, text, color) in notes {
+            let x = match last {
+                Some((held, end)) if held == line => end + metrics.cell_advance,
+                _ => match self.ensure_line(line) {
+                    Some(cached) => cached.shaped.width + 2.0 * metrics.cell_advance,
+                    None => continue,
+                },
+            };
+            let Some(shaper) = self.shaper.as_mut() else {
+                return;
+            };
+            let shaped = self.shaping.shape(shaper, &self.families, &text, &metrics);
+            let y = self.line_y(line) + metrics.baseline - metrics.ascent;
+            let at = Point::new(DevicePx(text_x0 + x), DevicePx(y));
+            for run in shaped.runs.iter() {
+                painter.glyphs(&run.as_run(PaintSlot(0)), at, color);
+            }
+            last = Some((line, x + shaped.width));
+        }
+    }
+
     /// Draws the lines an application asked for under the text.
     fn paint_decoration_underlines(
         &mut self,
@@ -1219,7 +1272,8 @@ impl EditorShared {
                 DecorationKind::Background(_)
                 | DecorationKind::LineBackground(_)
                 | DecorationKind::LineBar(_)
-                | DecorationKind::Conceal { .. } => None,
+                | DecorationKind::Conceal { .. }
+                | DecorationKind::Note { .. } => None,
             })
             .collect();
 
