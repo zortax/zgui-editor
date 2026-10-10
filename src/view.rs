@@ -159,25 +159,28 @@ pub fn Editor(
         handle.set_language(Some(language));
     }
 
-    // What layout read off the style sheet. Reported into a signal so the change becomes a
-    // repaint on the frame after — the element may not invalidate itself from inside its own
+    // What layout read off the style sheet. Reported into a signal so the change reaches the
+    // signals on the frame after — the element may not invalidate itself from inside its own
     // layout.
+    //
+    // A new viewport is a new size, and the frame that laid the element out at that size also
+    // painted it there. A new face or theme can keep the size, so only those ask for a repaint.
     let styled = RwSignal::new_local(None::<crate::render::shared::StyleReport>);
     shared.borrow_mut().on_style = Some(Rc::new(move |report| styled.set(Some(report))));
     let restyle = RenderEffect::new({
         let handle = handle.clone();
-        move |_| {
-            if styled.get().is_some() {
-                let mut shared = handle.ctx.shared.borrow_mut();
-                // The viewport may have changed; keep the view inside the document.
-                let total = shared.line_count();
-                let viewport = shared.viewport_lines();
-                let top = shared.scroll.pos.line;
-                shared.scroll.scroll_to(top, total, viewport);
-                handle.update_signals(&mut shared);
-                drop(shared);
+        move |before: Option<Option<crate::render::shared::StyleReport>>| {
+            let report = styled.get()?;
+            let mut shared = handle.ctx.shared.borrow_mut();
+            handle.update_signals(&mut shared);
+            drop(shared);
+            let looks_same = before.flatten().is_some_and(|before| {
+                before.metrics == report.metrics && before.theme_version == report.theme_version
+            });
+            if !looks_same {
                 handle.ctx.element.repaint();
             }
+            Some(report)
         }
     });
     on_cleanup_local(move || drop(restyle));

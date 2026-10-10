@@ -487,6 +487,12 @@ impl EditorShared {
         };
         if self.reported != Some(report) {
             self.reported = Some(report);
+            // The view stays inside the document at its new height. This frame paints at that
+            // height, so the scroll position is clamped before the paint.
+            let total = self.line_count();
+            let lines = self.viewport_lines();
+            let top = self.scroll.pos.line;
+            self.scroll.scroll_to(top, total, lines);
             if let Some(tell) = self.on_style.as_ref() {
                 tell(report);
             }
@@ -1701,6 +1707,29 @@ mod tests {
             "the new property is looked up"
         );
         assert!(!shared.decorations_need_style());
+    }
+
+    #[test]
+    fn a_layout_that_makes_the_view_taller_keeps_it_inside_the_document() {
+        let mut shared = windowed(&"line\n".repeat(100), None);
+        let style = zgui_css::StyleDraft::initial().build();
+        let line = shared.metrics.line_height;
+        shared.read_style(&style, 1.0, (400.0, 10.0 * line), true);
+        let bottom = |shared: &EditorShared| {
+            crate::scroll::ScrollState::max_top(shared.line_count(), shared.viewport_lines())
+        };
+        shared.scroll.pos.line = bottom(&shared);
+        let was = shared.scroll.pos.line;
+
+        shared.read_style(&style, 1.0, (400.0, 40.0 * line), false);
+        assert_eq!(shared.scroll.pos.line, was, "a measure pass moves nothing");
+        shared.read_style(&style, 1.0, (400.0, 40.0 * line), true);
+        assert!(shared.scroll.pos.line < was);
+        assert_eq!(
+            shared.scroll.pos.line,
+            bottom(&shared),
+            "the last line stays at the bottom of the taller view"
+        );
     }
 
     #[test]
