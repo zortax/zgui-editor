@@ -674,6 +674,7 @@ pub fn Editor(
             let mut needs_glide = false;
             {
                 let mut shared = shared.borrow_mut();
+                let before = (shared.scroll.target_line, shared.scroll.pos.x_px);
                 let total = shared.line_count();
                 let viewport = shared.viewport_lines();
                 let line_height = f64::from(shared.metrics.line_height);
@@ -712,6 +713,11 @@ pub fn Editor(
                     }
                     _ => return,
                 }
+                // At an edge the view does not move, and the wheel scrolls what holds the editor,
+                // as a browser chains a scroll that a scrolled-out box cannot take.
+                if (shared.scroll.target_line, shared.scroll.pos.x_px) == before {
+                    return;
+                }
                 handle.update_signals(&mut shared);
             }
             handle.ctx.element.repaint();
@@ -721,6 +727,8 @@ pub fn Editor(
             if let Some(tell) = handle.ctx.on_event.borrow().as_ref() {
                 tell(EditorEvent::Scrolled);
             }
+            // The editor took the scroll, so the container around it does not scroll as well.
+            cx.prevent_default();
             cx.stop_propagation();
         }
     };
