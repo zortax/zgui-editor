@@ -218,7 +218,7 @@ pub fn hit_byte(shaped: &ShapedLine, x: f32) -> u32 {
 mod tests {
     use std::rc::Rc;
 
-    use zgui::custom::{FaceId, ShapedGlyph, ShapedRunOwned};
+    use zgui::custom::{FaceId, ShapedGlyph, ShapedRunOwned, VariationInstance};
 
     use super::*;
     use crate::render::shaping::TabMap;
@@ -239,6 +239,7 @@ mod tests {
                 synthetic_bold: 0.0,
                 synthetic_slant: 0.0,
                 has_color: false,
+                instance: VariationInstance::DEFAULT,
                 glyphs,
                 clusters: clusters.clone(),
             }]),
