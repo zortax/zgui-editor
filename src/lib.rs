@@ -28,6 +28,9 @@
 //! dots written as hyphens (`--syntax-function-method`), falling back along the dots and then
 //! to the foreground. Fonts, `tab-size` and `cursor` are ordinary CSS on the element.
 //!
+//! The element's `padding` works as a scroll container's: the text and the gutter start inside
+//! it, the scrollbars stay at the element's edges, and scrolled text moves through it.
+//!
 //! # Marking the text
 //!
 //! An application draws on the buffer through [`decoration`]: named layers of bands, underlines

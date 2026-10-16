@@ -27,6 +27,7 @@ use crate::document::{Document, ViewId};
 use crate::event::EditorEvent;
 use crate::overlay::Overlay;
 use crate::render::element::EditorElement;
+use crate::render::frame::EditorFrame;
 use crate::render::shared::EditorShared;
 use crate::syntax::registry::LanguageRegistry;
 
@@ -216,8 +217,14 @@ pub(crate) struct EditorCtx {
     /// itself.
     pub view_id: Cell<ViewId>,
     pub shared: Rc<RefCell<EditorShared>>,
+    /// The element the editor is drawn by.
     pub element: zgui::custom::CustomHandle<EditorElement>,
+    /// The root element, which CSS sizes and pads.
+    pub frame: zgui::custom::CustomHandle<EditorFrame>,
+    /// The root, for focus.
     pub port: NodeRef,
+    /// The drawing element, whose box is the frame's padding box.
+    pub canvas: NodeRef,
     pub clipboards: Option<Clipboards>,
     /// The editor's own clipboards, standard then primary: where copies go without the desktop's.
     pub own: RefCell<[Option<String>; 2]>,
@@ -227,6 +234,15 @@ pub(crate) struct EditorCtx {
     pub start_glide: RefCell<Option<Box<dyn Fn()>>>,
     /// The languages this editor can highlight.
     pub registry: LanguageRegistry,
+}
+
+impl EditorCtx {
+    /// Says the editor's size or its geometry changed: the frame and the drawing element are
+    /// measured again.
+    pub fn relayout(&self) {
+        self.frame.relayout();
+        self.element.relayout();
+    }
 }
 
 /// Drives one mounted editor. Cloneable; UI-thread only.
@@ -252,11 +268,14 @@ impl PartialEq for EditorHandle {
 impl Eq for EditorHandle {}
 
 impl EditorHandle {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         document: Document,
         shared: Rc<RefCell<EditorShared>>,
         element: zgui::custom::CustomHandle<EditorElement>,
+        frame: zgui::custom::CustomHandle<EditorFrame>,
         port: NodeRef,
+        canvas: NodeRef,
         clipboards: Option<Clipboards>,
         on_event: Option<Box<dyn Fn(EditorEvent)>>,
         registry: LanguageRegistry,
@@ -267,7 +286,9 @@ impl EditorHandle {
                 view_id: Cell::new(ViewId::UNATTACHED),
                 shared,
                 element,
+                frame,
                 port,
+                canvas,
                 clipboards,
                 own: RefCell::new([None, None]),
                 on_event: RefCell::new(on_event),
@@ -360,7 +381,7 @@ impl EditorHandle {
         };
         self.settle(response);
         self.scan_max_width();
-        self.ctx.element.relayout();
+        self.ctx.relayout();
     }
 
     /// Highlights as `language` — a name in the registry — from now on; `None` turns
@@ -466,7 +487,7 @@ impl EditorHandle {
             return;
         }
         if needs_style {
-            self.ctx.element.relayout();
+            self.ctx.relayout();
         } else {
             self.ctx.element.repaint();
         }
@@ -542,7 +563,7 @@ impl EditorHandle {
     /// Changes how the gutter numbers its lines.
     pub fn set_gutter(&self, mode: GutterMode) {
         self.ctx.shared.borrow_mut().config.gutter = mode;
-        self.ctx.element.relayout();
+        self.ctx.relayout();
     }
 
     /// Says where a [`GutterMode::Custom`] gutter's labels come from.
@@ -584,7 +605,7 @@ impl EditorHandle {
         };
         // A new vocabulary may name colours the last layout never read off the sheet.
         if renamed {
-            self.ctx.element.relayout();
+            self.ctx.relayout();
         } else {
             self.ctx.element.repaint();
         }
@@ -667,7 +688,7 @@ impl EditorHandle {
             }
             shared.config.line_window = window;
         }
-        self.ctx.element.relayout();
+        self.ctx.relayout();
     }
 
     /// Which lines the view draws, when it draws only some of them.
@@ -739,7 +760,7 @@ impl EditorHandle {
         }
         let scale = shared.metrics.scale.max(0.001);
         Some(CaretRect {
-            x: (shared.gutter_width() - shared.scroll.pos.x_px as f32 + x) / scale,
+            x: (shared.text_x0() + x) / scale,
             y: shared.line_y(line) / scale,
             width: 2.0,
             height: shared.metrics.line_height / scale,
@@ -751,7 +772,7 @@ impl EditorHandle {
     /// The inverse of [`point_for_byte`](Self::point_for_byte), and what a click in a decoration
     /// an application drew over the editor has to be turned back into.
     pub fn byte_for_point(&self, x: f32, y: f32) -> Option<usize> {
-        let bounds = self.ctx.port.window_bounds()?;
+        let bounds = self.ctx.canvas.window_bounds()?;
         let mut shared = self.ctx.shared.borrow_mut();
         let scale = shared.metrics.scale.max(0.001);
         let local_x = x * scale - bounds.origin.x.0;
@@ -848,7 +869,7 @@ impl EditorHandle {
             }
             self.update_signals(&mut shared);
         }
-        self.ctx.element.relayout();
+        self.ctx.relayout();
     }
 
     fn dispatch(&self, command: &Command) {
@@ -897,7 +918,7 @@ impl EditorHandle {
         }
 
         if relayout {
-            self.ctx.element.relayout();
+            self.ctx.relayout();
         } else {
             self.ctx.element.repaint();
         }
@@ -1105,9 +1126,9 @@ impl EditorHandle {
         // The window's space, not the parent's: `bounds` stops at the parent's border box, so an
         // editor inside anything at all would answer a place that is short by however far its
         // ancestors are down and across the window.
-        let bounds = self.ctx.port.window_bounds()?;
+        let bounds = self.ctx.canvas.window_bounds()?;
         let scale = shared.metrics.scale.max(0.001);
-        let element_x = shared.gutter_width() - shared.scroll.pos.x_px as f32 + x;
+        let element_x = shared.text_x0() + x;
         let element_y = shared.line_y(line);
         Some(CaretRect {
             x: (bounds.origin.x.0 + element_x) / scale,

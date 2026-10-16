@@ -99,9 +99,9 @@ pub struct EditorConfig {
     /// Which lines the view draws, when it draws only some of them.
     ///
     /// A window turns one editor into a view of one part of a document: it draws exactly these
-    /// lines, sizes itself to them, and never scrolls vertically. The gutter still numbers the
-    /// real lines, the caret still moves through the whole text, and the history is still the
-    /// document's own.
+    /// lines, sizes itself to them plus its padding, and never scrolls vertically. The gutter
+    /// still numbers the real lines, the caret still moves through the whole text, and the
+    /// history is still the document's own.
     ///
     /// What a rendered document puts a real editor over one block with, and what a preview shows
     /// a hit in its own place with. `None` draws the whole document, which is the usual thing.

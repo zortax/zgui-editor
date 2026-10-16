@@ -32,7 +32,10 @@ const SHEET: &str = zgui::css!(
         --editor-cursor: #f5e0dc;
         --editor-scrollbar-thumb: rgba(108, 112, 134, 0.5);
         --editor-search: rgba(249, 226, 175, 0.35);
-    }"
+    }
+    .app__editor--padded { padding: 12px; }
+    .app__editor--framed { padding: 12px; border: 3px solid #f38ba8; }
+    .app__editor.app__editor--snippet { flex: none; }"
 );
 
 /// The same, with the editor pushed away from the window's origin by a header and a sidebar.
@@ -49,6 +52,31 @@ fn mounted(text: &'static str) -> (Harness<Runtime>, EditorHandle) {
 }
 
 fn mounted_with(text: &'static str, offset: bool) -> (Harness<Runtime>, EditorHandle) {
+    mounted_as(
+        text,
+        offset,
+        "app__editor",
+        zgui_editor::EditorConfig::default(),
+    )
+}
+
+/// The same, with twelve pixels of padding on the editor.
+fn mounted_padded(text: &'static str, offset: bool) -> (Harness<Runtime>, EditorHandle) {
+    mounted_as(
+        text,
+        offset,
+        "app__editor app__editor--padded",
+        zgui_editor::EditorConfig::default(),
+    )
+}
+
+/// An editor with `class` and `config`, at the origin or pushed away from it.
+fn mounted_as(
+    text: &'static str,
+    offset: bool,
+    class: &'static str,
+    config: zgui_editor::EditorConfig,
+) -> (Harness<Runtime>, EditorHandle) {
     let taken: Rc<RefCell<Option<EditorHandle>>> = Rc::new(RefCell::new(None));
     let fonts = zgui::app::Fonts::shipped_only();
     let context_fonts = fonts.clone();
@@ -85,14 +113,14 @@ fn mounted_with(text: &'static str, offset: bool) -> (Harness<Runtime>, EditorHa
                             box(class = "app__header") {}
                             row(class = "app__body") {
                                 box(class = "app__side") {}
-                                Editor(class = "app__editor", text = text, on_ready = on_ready)
+                                Editor(class = class, text = text, config = config.clone(), on_ready = on_ready)
                             }
                         }
                     })
                 } else {
                     zgui::view::AnyView::new(view! {
                         column(class = "app") {
-                            Editor(class = "app__editor", text = text, on_ready = on_ready)
+                            Editor(class = class, text = text, config = config.clone(), on_ready = on_ready)
                         }
                     })
                 };
@@ -553,4 +581,185 @@ fn a_note_paints_nothing_into_the_text_and_clears_with_its_layer() {
     );
     handle.clear_decorations("admission");
     assert_eq!(quads_after(&mut harness, &handle), bare);
+}
+
+/// The border boxes of the editor's two elements, the frame first.
+fn editor_boxes(harness: &mut Harness<Runtime>) -> Vec<[f32; 4]> {
+    let window = &harness.app_mut().windows_mut()[0];
+    let document = window.document().borrow();
+    let layout = window.layout().borrow();
+    let mut boxes = Vec::new();
+    for key in layout.keys() {
+        let Some(source) = layout.node(key).source else {
+            continue;
+        };
+        let Some(index) = document.store().index_of(source) else {
+            continue;
+        };
+        if document.store().core(index).local_name().as_str() != "custom" {
+            continue;
+        }
+        let Some(fragment) = layout
+            .fragments_of_box(key)
+            .first()
+            .and_then(|fragment| layout.fragment(*fragment))
+        else {
+            continue;
+        };
+        let border = fragment.border_box;
+        boxes.push([
+            border.origin.x.0,
+            border.origin.y.0,
+            border.size.width.0,
+            border.size.height.0,
+        ]);
+    }
+    // The frame holds the drawing element, so it is the larger of the two.
+    boxes.sort_by(|a, b| (b[2] * b[3]).total_cmp(&(a[2] * a[3])));
+    boxes
+}
+
+/// The byte line `line` starts at.
+fn line_start(handle: &EditorHandle, line: usize) -> usize {
+    handle.query(|snapshot| {
+        let rope = snapshot.rope();
+        rope.char_to_byte(rope.line_to_char(line))
+    })
+}
+
+#[test]
+fn a_padded_editor_keeps_its_scrollbar_at_the_edge() {
+    let text: &'static str = Box::leak("line\n".repeat(100).into_boxed_str());
+    let (mut harness, handle) = mounted_padded(text, false);
+    let quads = quads_after(&mut harness, &handle);
+    assert!(
+        quads
+            .iter()
+            .any(|quad| quad[0] + quad[2] == 640.0 && quad[1] == 0.0 && quad[2] == 10.0),
+        "the thumb sits against the right edge and at the top: {quads:?}"
+    );
+}
+
+#[test]
+fn a_padded_editor_insets_the_caret_and_the_current_line() {
+    let (mut harness, handle) = mounted_padded("one\ntwo\n", false);
+    let quads = quads_after(&mut harness, &handle);
+    let first = handle.local_point_for_byte(0).expect("on screen");
+    assert!(
+        first.x > 12.0,
+        "the text starts past the padding and the gutter"
+    );
+    assert_eq!(first.y, 12.0, "the first line starts below the top padding");
+    let line = first.height;
+
+    assert!(
+        quads
+            .iter()
+            .any(|quad| quad[0] == first.x && quad[1] == 12.0 && quad[2] == 2.0),
+        "the bar caret is at the first byte: {quads:?}"
+    );
+    assert!(
+        quads.iter().any(|quad| quad[0] == first.x
+            && quad[1] == 12.0
+            && quad[0] + quad[2] == 640.0
+            && quad[3] == line),
+        "the current line runs from the gutter to the right edge: {quads:?}"
+    );
+}
+
+#[test]
+fn a_padded_editor_maps_bytes_and_points_through_its_padding() {
+    let (mut harness, handle) = mounted_padded("one\ntwo\nthree\nfour\nfive\nsix\n", true);
+    harness.settle(8);
+
+    let local = handle.local_point_for_byte(0).expect("on screen");
+    assert_eq!(local.y, 12.0, "inside the element, below the top padding");
+    let window = handle.point_for_byte(0).expect("on screen");
+    assert_eq!(
+        window.y,
+        30.0 + 12.0,
+        "below the header and the top padding"
+    );
+
+    for line in 0..6usize {
+        let at = handle
+            .point_for_byte(line_start(&handle, line))
+            .expect("every line is on screen");
+        let back = handle
+            .byte_for_point(at.x + 1.0, at.y + at.height / 2.0)
+            .unwrap_or_else(|| panic!("line {line} at {at:?} is inside the editor"));
+        assert_eq!(
+            handle.query(|snapshot| snapshot.line_col(back).line),
+            line,
+            "the middle of line {line}'s row lands on line {line}"
+        );
+    }
+
+    let back = handle
+        .byte_for_point(window.x + 1.0, 30.0 + 4.0)
+        .expect("the padding is inside the editor");
+    assert_eq!(
+        handle.query(|snapshot| snapshot.line_col(back).line),
+        0,
+        "a press in the top padding lands on the first line"
+    );
+}
+
+#[test]
+fn the_drawing_element_fills_the_frames_padding_box() {
+    let (mut harness, _handle) = mounted_as(
+        "one\ntwo\n",
+        false,
+        "app__editor app__editor--framed",
+        zgui_editor::EditorConfig::default(),
+    );
+    let boxes = editor_boxes(&mut harness);
+    assert_eq!(boxes.len(), 2, "a frame and a drawing element: {boxes:?}");
+    let (frame, canvas) = (boxes[0], boxes[1]);
+    assert_eq!(frame, [0.0, 0.0, 640.0, 480.0]);
+    assert_eq!(
+        canvas,
+        [3.0, 3.0, 634.0, 474.0],
+        "the drawing element is the frame less its border"
+    );
+}
+
+#[test]
+fn a_padded_window_is_as_tall_as_its_lines_and_its_padding() {
+    let config = zgui_editor::EditorConfig {
+        line_window: Some(0..3),
+        ..zgui_editor::EditorConfig::default()
+    };
+    let (mut harness, handle) = mounted_as(
+        "one\ntwo\nthree\nfour\nfive\n",
+        false,
+        "app__editor app__editor--padded app__editor--snippet",
+        config,
+    );
+    let line = handle.local_point_for_byte(0).expect("on screen").height;
+    let boxes = editor_boxes(&mut harness);
+    assert_eq!(boxes[0][3], 3.0 * line + 24.0, "{boxes:?}");
+    assert_eq!(
+        boxes[1][3],
+        3.0 * line + 24.0,
+        "the drawing element fills it"
+    );
+}
+
+#[test]
+fn a_padded_editor_scrolled_to_the_end_stops_above_the_bottom_padding() {
+    let text: &'static str = Box::leak("line\n".repeat(100).into_boxed_str());
+    let (mut harness, handle) = mounted_padded(text, false);
+    handle.set_smooth_scroll(false);
+    handle.command(zgui_editor::Command::Scroll(
+        zgui_editor::ScrollCmd::ToLine(1000),
+    ));
+    harness.settle(8);
+    let last = handle
+        .point_for_byte(text.len())
+        .expect("the last line is on screen");
+    assert!(
+        (last.y + last.height - (480.0 - 12.0)).abs() < 1e-3,
+        "the last line ends at the bottom padding: {last:?}"
+    );
 }

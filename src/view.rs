@@ -2,9 +2,9 @@
 //!
 //! Everything here is wiring: the model, the caches and the painting live in
 //! [`EditorShared`](crate::render::shared::EditorShared); the handlers below turn framework
-//! events into [`Command`]s and say what changed through the element handle. The one custom
-//! element is sized by CSS and paints only the visible lines, which is what keeps a
-//! ten-million-line buffer costing what the viewport costs.
+//! events into [`Command`]s and say what changed through the element handle. The root frame is
+//! sized by CSS; the element inside it fills the frame's padding box and paints only the visible
+//! lines, which is what keeps a ten-million-line buffer costing what the viewport costs.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -22,21 +22,16 @@ use crate::handle::EditorHandle;
 use crate::input::keymap::default_keymap;
 use crate::input::mouse::{ClickCounter, ClickKind};
 use crate::render::element::EditorElement;
+use crate::render::frame::EditorFrame;
 use crate::render::shared::EditorShared;
 
 zgui::style! { pub EditorStyle =>
     ":scope {
-        display: flex;
         flex: 1;
         min-width: 0;
         min-height: 0;
         overflow: hidden;
         cursor: text;
-    }"
-    ":scope > custom {
-        flex: 1;
-        min-width: 0;
-        min-height: 0;
     }"
 }
 
@@ -50,9 +45,10 @@ const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 ///
 /// The component fills the space its container gives it (`flex: 1`), draws entirely through its
 /// own element, and is themed through CSS custom properties — see the crate documentation for
-/// the list. Everything an application does to it goes through the [`EditorHandle`] delivered
-/// by `on_ready` (and through local context); everything modal — a vim layer — is built on
-/// `on_key`, which hears every key first.
+/// the list. Its `padding` works as a scroll container's: the text starts inside it, the
+/// scrollbars stay at the edges, and scrolled text moves through it. Everything an application
+/// does to it goes through the [`EditorHandle`] delivered by `on_ready` (and through local
+/// context); everything modal — a vim layer — is built on `on_key`, which hears every key first.
 #[component]
 #[allow(clippy::too_many_arguments)]
 pub fn Editor(
@@ -116,7 +112,9 @@ pub fn Editor(
 
     let (element_view, element_handle) =
         zgui::custom::custom(EditorElement::new(Rc::clone(&shared)));
+    let (frame_view, frame_handle) = zgui::custom::custom(EditorFrame::new(Rc::clone(&shared)));
     let port = NodeRef::new();
+    let canvas = NodeRef::new();
     let clipboards = try_use_clipboard();
 
     let registry =
@@ -125,7 +123,9 @@ pub fn Editor(
         document.clone(),
         Rc::clone(&shared),
         element_handle.clone(),
+        frame_handle,
         port,
+        canvas,
         clipboards,
         on_event,
         registry,
@@ -164,7 +164,8 @@ pub fn Editor(
     // layout.
     //
     // A new viewport is a new size, and the frame that laid the element out at that size also
-    // painted it there. A new face or theme can keep the size, so only those ask for a repaint.
+    // painted it there. A new face, theme or padding can keep the size, so only those ask for a
+    // repaint.
     let styled = RwSignal::new_local(None::<crate::render::shared::StyleReport>);
     shared.borrow_mut().on_style = Some(Rc::new(move |report| styled.set(Some(report))));
     let restyle = RenderEffect::new({
@@ -175,7 +176,9 @@ pub fn Editor(
             handle.update_signals(&mut shared);
             drop(shared);
             let looks_same = before.flatten().is_some_and(|before| {
-                before.metrics == report.metrics && before.theme_version == report.theme_version
+                before.metrics == report.metrics
+                    && before.theme_version == report.theme_version
+                    && before.insets == report.insets
             });
             if !looks_same {
                 handle.ctx.element.repaint();
@@ -363,15 +366,16 @@ pub fn Editor(
         )
     };
 
-    // Where a pointer event landed, in element-local device pixels.
+    // Where a pointer event landed, in device pixels from the drawing element's corner, which is
+    // the frame's padding-box corner.
     //
     // Against the *window* box. `bounds` is relative to the parent, so it is the element's offset
     // inside whatever holds it — which is exactly right for an editor that fills the window and
     // wrong by the height of a header for one that does not. A caret that lands a line or two
     // from the pointer is this.
     let local_point = move |position: zgui::geom::Point<zgui::geom::CssPx, zgui::geom::Css>| {
-        let bounds = port.window_bounds()?;
-        let scale = port.scale();
+        let bounds = canvas.window_bounds()?;
+        let scale = canvas.scale();
         Some((
             position.x.0 * scale - bounds.origin.x.0,
             position.y.0 * scale - bounds.origin.y.0,
@@ -573,9 +577,10 @@ pub fn Editor(
                         primary: 0,
                     });
 
-                    // A pointer dragged past the edge keeps selecting: an interval scrolls the
+                    // A pointer dragged past the text keeps selecting: an interval scrolls the
                     // view toward it and re-extends until it comes back or lets go.
-                    let outside = y < 0.0 || y > shared.borrow().viewport.1;
+                    let (top, bottom) = shared.borrow().text_band();
+                    let outside = y < top || y > bottom;
                     if outside && autoscroll.borrow().is_none() {
                         autoscroll_last.set(Instant::now());
                         let tick = {
@@ -599,11 +604,11 @@ pub fn Editor(
                                 };
                                 let byte = {
                                     let mut shared = shared.borrow_mut();
-                                    let height = shared.viewport.1;
-                                    let overshoot = if y < 0.0 {
-                                        f64::from(y)
-                                    } else if y > height {
-                                        f64::from(y - height)
+                                    let (top, bottom) = shared.text_band();
+                                    let overshoot = if y < top {
+                                        f64::from(y - top)
+                                    } else if y > bottom {
+                                        f64::from(y - bottom)
                                     } else {
                                         return;
                                     };
@@ -616,7 +621,7 @@ pub fn Editor(
                                     let target = shared.scroll.pos.line + rate * dt;
                                     shared.scroll.scroll_to(target, total, viewport);
                                     handle.update_signals(&mut shared);
-                                    shared.hit_test(x, y.clamp(0.0, height))
+                                    shared.hit_test(x, y.clamp(top, bottom))
                                 };
                                 handle.command(Command::SetSelections {
                                     selections: vec![drag_selection(byte, granularity, &origin)],
@@ -798,27 +803,30 @@ pub fn Editor(
     }
     provide_local_context(handle.clone());
 
-    AnyView::new(view! {
-        box(
-            class = EditorStyle::CLASS,
-            class = "editor",
-            class = class,
-            node_ref = port,
-            tabindex = if focusable { Focus::Sequential } else { Focus::Programmatic },
-            on:key_down = key_down,
-            on:pointer_down = pointer_down,
-            on:pointer_move = pointer_move,
-            on:pointer_up = pointer_up,
-            on:pointer_leave = pointer_leave,
-            style:cursor = move || {
+    // Built by hand: the root is a custom element, which `view!` has no tag for.
+    AnyView::new(
+        frame_view
+            .class(EditorStyle::CLASS)
+            .class("editor")
+            .class(class)
+            .node_ref(port)
+            .tabindex(if focusable {
+                Focus::Sequential
+            } else {
+                Focus::Programmatic
+            })
+            .on(events::KEY_DOWN, key_down)
+            .on(events::POINTER_DOWN, pointer_down)
+            .on(events::POINTER_MOVE, pointer_move)
+            .on(events::POINTER_UP, pointer_up)
+            .on(events::POINTER_LEAVE, pointer_leave)
+            .style_property("cursor", move || {
                 over_scrollbar.get().then(|| "default".to_string())
-            },
-            on:wheel = wheel,
-            on:focus_in = focus_in,
-            on:focus_out = focus_out,
-            {..attrs}
-        ) {
-            {element_view.into_view()}
-        }
-    })
+            })
+            .on(events::WHEEL, wheel)
+            .on(events::FOCUS_IN, focus_in)
+            .on(events::FOCUS_OUT, focus_out)
+            .attrs(attrs)
+            .child(element_view.node_ref(canvas)),
+    )
 }

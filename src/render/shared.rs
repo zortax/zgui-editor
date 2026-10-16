@@ -54,8 +54,26 @@ pub struct StyleReport {
     pub metrics: TextMetrics,
     /// Which theme this is, counting up.
     pub theme_version: u32,
-    /// The element's content size, in device pixels.
+    /// The element's padding-box size, in device pixels.
     pub viewport: (f32, f32),
+    /// The element's padding, in device pixels.
+    pub insets: Insets,
+}
+
+/// The padding around the text, in device pixels.
+///
+/// The view draws in the element's padding box. The text and the gutter start inside this
+/// padding, the scrollbars stay at the edges, and scrolled text moves through the padding.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Insets {
+    /// Above the first line.
+    pub top: f32,
+    /// Right of the text.
+    pub right: f32,
+    /// Below the last line.
+    pub bottom: f32,
+    /// Left of the gutter.
+    pub left: f32,
 }
 
 /// One view of one document, as one mutable value.
@@ -108,8 +126,10 @@ pub struct EditorShared {
     pub syntax_tx: Option<flume::Sender<crate::syntax::worker::ToWorker>>,
     /// The visible range last asked of the worker, so scrolling asks again only when it must.
     pub requested_window: Range<usize>,
-    /// The element's content size, in device pixels, from the last layout.
+    /// The element's padding-box size, in device pixels, from the last layout.
     pub viewport: (f32, f32),
+    /// The element's padding, from the last layout.
+    pub insets: Insets,
     /// Whether the editor has focus.
     pub focused: bool,
     /// Whether this is the view a person is working in.
@@ -166,6 +186,7 @@ impl EditorShared {
             syntax_tx: None,
             requested_window: 0..0,
             viewport: (0.0, 0.0),
+            insets: Insets::default(),
             focused: false,
             active: true,
             blink_on: true,
@@ -281,9 +302,10 @@ impl EditorShared {
         }
     }
 
-    /// How many whole lines the viewport shows.
+    /// How many whole lines the viewport shows inside its padding.
     pub fn viewport_lines(&self) -> f64 {
-        (f64::from(self.viewport.1) / f64::from(self.metrics.line_height)).max(1.0)
+        let height = self.viewport.1 - self.insets.top - self.insets.bottom;
+        (f64::from(height) / f64::from(self.metrics.line_height)).max(1.0)
     }
 
     /// The context motions resolve against.
@@ -316,7 +338,34 @@ impl EditorShared {
 
     /// How wide the text area is, in device pixels.
     pub fn text_area_width(&self) -> f32 {
-        (self.viewport.0 - self.gutter_width()).max(1.0)
+        (self.viewport.0 - self.insets.left - self.insets.right - self.gutter_width()).max(1.0)
+    }
+
+    /// Where the text area starts, in device pixels from the element's left edge.
+    pub fn text_left(&self) -> f32 {
+        self.insets.left + self.gutter_width()
+    }
+
+    /// Where the text's own x zero is drawn, after horizontal scrolling.
+    pub fn text_x0(&self) -> f32 {
+        self.text_left() - self.scroll.pos.x_px as f32
+    }
+
+    /// The top and the bottom of the lines' area, in device pixels from the element's top: the
+    /// viewport less its vertical padding.
+    pub fn text_band(&self) -> (f32, f32) {
+        (self.insets.top, self.viewport.1 - self.insets.bottom)
+    }
+
+    /// Where a band as wide as a line starts.
+    ///
+    /// At the gutter's right edge, or at the element's left edge when there is no gutter.
+    fn band_left(&self) -> f32 {
+        if self.gutter_width() > 0.0 {
+            self.text_left()
+        } else {
+            0.0
+        }
     }
 
     /// How far the text can scroll horizontally: the widest line known, in device pixels.
@@ -350,11 +399,13 @@ impl EditorShared {
         if max <= area {
             return None;
         }
-        let track = area;
+        // The track runs from the text area's left edge to the element's right edge.
+        let left = self.band_left();
+        let track = (self.viewport.0 - left).max(1.0);
         let width = (track * area / max).max(30.0).min(track);
         let travel = f64::from(track - width);
         let position = (self.scroll.pos.x_px / f64::from(max - area)).clamp(0.0, 1.0);
-        Some((self.gutter_width() + (travel * position) as f32, width))
+        Some((left + (travel * position) as f32, width))
     }
 
     /// How wide the gutter is.
@@ -366,9 +417,10 @@ impl EditorShared {
         )
     }
 
-    /// The top of `line`, in device pixels from the content box's top.
+    /// The top of `line`, in device pixels from the padding box's top.
     pub fn line_y(&self, line: usize) -> f32 {
-        ((line as f64 - self.top_line()) * f64::from(self.metrics.line_height)) as f32
+        let below = (line as f64 - self.top_line()) * f64::from(self.metrics.line_height);
+        self.insets.top + below as f32
     }
 
     /// The lines any part of which is on screen.
@@ -379,7 +431,9 @@ impl EditorShared {
             return window;
         }
         let total = self.line_count();
-        let first = self.scroll.pos.line.floor().max(0.0) as usize;
+        // The top padding shows the lines above the top line.
+        let above = f64::from(self.insets.top) / f64::from(self.metrics.line_height);
+        let first = (self.scroll.pos.line - above).floor().max(0.0) as usize;
         let rows =
             (f64::from(self.viewport.1) / f64::from(self.metrics.line_height)).ceil() as usize + 1;
         first.min(total)..(first + rows).min(total)
@@ -479,11 +533,30 @@ impl EditorShared {
             return;
         }
         self.viewport = viewport;
+        self.report();
+    }
 
+    /// Sets the padding the frame read off its style, on the frame's final layout pass.
+    ///
+    /// A new padding inside a box of the same size moves the text without a new size for the
+    /// element, so it is reported here as well.
+    pub fn set_insets(&mut self, insets: Insets) {
+        if self.insets == insets {
+            return;
+        }
+        self.insets = insets;
+        if self.reported.is_some() {
+            self.report();
+        }
+    }
+
+    /// Reports what layout read, when it differs from the last report.
+    fn report(&mut self) {
         let report = StyleReport {
             metrics: self.metrics,
             theme_version: self.theme_version,
-            viewport,
+            viewport: self.viewport,
+            insets: self.insets,
         };
         if self.reported != Some(report) {
             self.reported = Some(report);
@@ -754,10 +827,11 @@ impl EditorShared {
     pub fn hit_test(&mut self, x: f32, y: f32) -> usize {
         let rope = self.rope();
         let total = position::line_count(&rope);
-        let line_f = self.top_line() + f64::from(y) / f64::from(self.metrics.line_height);
+        let below = f64::from(y - self.insets.top) / f64::from(self.metrics.line_height);
+        let line_f = self.top_line() + below;
         let line = (line_f.max(0.0) as usize).min(total.saturating_sub(1));
         let start = position::line_start(&rope, line);
-        let text_x = x - self.gutter_width() + self.scroll.pos.x_px as f32;
+        let text_x = x - self.text_left() + self.scroll.pos.x_px as f32;
         if text_x <= 0.0 {
             return start;
         }
@@ -781,12 +855,14 @@ impl EditorShared {
         let size = painter.size();
         let width = size.width.0;
         let height = size.height.0;
-        // The painter's size is the placed content box — the one truth about how big the
-        // editor is this frame. Everything geometric downstream reads `viewport`.
+        // The painter's size is the frame's placed padding box — the one truth about how big
+        // the editor is this frame. Everything geometric downstream reads `viewport`.
         self.viewport = (width, height);
         let metrics = self.metrics;
+        let insets = self.insets;
         let gutter_w = self.gutter_width();
-        let text_x0 = gutter_w - self.scroll.pos.x_px as f32;
+        let text_x0 = self.text_x0();
+        let band_left = self.band_left();
         let visible = self.visible_lines();
         let rope = self.rope();
         // Which line the caret is on: the overlay's when it places the carets, and the line the
@@ -804,7 +880,7 @@ impl EditorShared {
         if let Some(color) = self.theme.gutter_bg
             && gutter_w > 0.0
         {
-            fill(painter, 0.0, 0.0, gutter_w, height, color);
+            fill(painter, 0.0, 0.0, insets.left + gutter_w, height, color);
         }
 
         // The band behind each caret's line, in the view being worked in.
@@ -814,9 +890,9 @@ impl EditorShared {
                     let y = self.line_y(*line);
                     fill(
                         painter,
-                        gutter_w,
+                        band_left,
                         y,
-                        width - gutter_w,
+                        width - band_left,
                         metrics.line_height,
                         color,
                     );
@@ -898,7 +974,7 @@ impl EditorShared {
         // The gutter's numbers, or the application's labels in their place.
         if self.config.gutter != GutterMode::None {
             let caret_line = caret_lines.first().copied().unwrap_or(0);
-            let number_right = gutter_w - metrics.cell_advance;
+            let number_right = insets.left + gutter_w - metrics.cell_advance;
             let source = self.gutter_source.clone();
             for line in visible.clone() {
                 let own = if line == caret_line {
@@ -1047,7 +1123,7 @@ impl EditorShared {
         }
         let rope = self.rope();
         let line_height = self.metrics.line_height;
-        let gutter_w = self.gutter_width();
+        let band_left = self.band_left();
         let width = self.viewport.0;
         let bar = (2.0 * self.metrics.scale).max(1.0);
         let bytes = self.visible_bytes(visible);
@@ -1067,7 +1143,7 @@ impl EditorShared {
                     let color = self.paint_color(paint);
                     for line in lines_touched(&rope, &decoration.range, visible) {
                         let y = self.line_y(line);
-                        fill(painter, gutter_w, y, width - gutter_w, line_height, color);
+                        fill(painter, band_left, y, width - band_left, line_height, color);
                     }
                 }
                 DecorationKind::LineBar(paint) => {
@@ -1365,7 +1441,10 @@ impl EditorShared {
             for run in shaped.runs.iter() {
                 painter.glyphs(
                     &run.as_run(PaintSlot(0)),
-                    Point::new(DevicePx(metrics.cell_advance * 0.25), DevicePx(y)),
+                    Point::new(
+                        DevicePx(self.insets.left + metrics.cell_advance * 0.25),
+                        DevicePx(y),
+                    ),
                     color,
                 );
             }
@@ -1630,7 +1709,7 @@ fn fill(painter: &mut ScenePainter<'_>, x: f32, y: f32, width: f32, height: f32,
 mod tests {
     use zgui::elements::kurbo::{PathEl, Shape as _};
 
-    use super::{EditorShared, underline_stroke};
+    use super::{EditorShared, Insets, underline_stroke};
     use crate::config::EditorConfig;
     use crate::decoration::UnderlineStyle;
     use crate::document::Document;
@@ -1644,6 +1723,117 @@ mod tests {
         let mut shared = EditorShared::new(Document::new(text), config, None);
         shared.viewport = (400.0, 20.0 * 20.0);
         shared
+    }
+
+    /// The same, with `insets` of padding around the text.
+    fn padded(text: &str, window: Option<std::ops::Range<usize>>, insets: Insets) -> EditorShared {
+        let mut shared = windowed(text, window);
+        shared.insets = insets;
+        shared
+    }
+
+    /// Twelve pixels on every side.
+    const TWELVE: Insets = Insets {
+        top: 12.0,
+        right: 12.0,
+        bottom: 12.0,
+        left: 12.0,
+    };
+
+    #[test]
+    fn the_top_line_starts_below_the_top_padding() {
+        let mut shared = padded(&"line\n".repeat(100), None, TWELVE);
+        assert_eq!(shared.line_y(0), 12.0);
+        shared.scroll.pos.line = 7.0;
+        assert_eq!(
+            shared.line_y(7),
+            12.0,
+            "the top line of a scrolled view too"
+        );
+    }
+
+    #[test]
+    fn the_viewport_lines_leave_out_the_vertical_padding() {
+        let shared = padded(&"line\n".repeat(100), None, TWELVE);
+        let line = f64::from(shared.metrics.line_height);
+        let height = f64::from(shared.viewport.1);
+        assert_eq!(shared.viewport_lines(), (height - 24.0) / line);
+    }
+
+    #[test]
+    fn scrolled_to_the_end_the_last_line_stops_above_the_bottom_padding() {
+        let mut shared = padded(&"line\n".repeat(100), None, TWELVE);
+        let total = shared.line_count();
+        shared.scroll.pos.line =
+            crate::scroll::ScrollState::max_top(total, shared.viewport_lines());
+        let bottom = shared.line_y(total - 1) + shared.metrics.line_height;
+        assert!(
+            (bottom - (shared.viewport.1 - 12.0)).abs() < 1e-3,
+            "the last line ends at {bottom}"
+        );
+    }
+
+    #[test]
+    fn the_top_padding_shows_the_lines_above_the_top_line() {
+        let mut shared = padded(&"line\n".repeat(100), None, Insets::default());
+        shared.insets.top = 2.0 * shared.metrics.line_height;
+        shared.scroll.pos.line = 5.0;
+        assert_eq!(shared.visible_lines().start, 3);
+    }
+
+    #[test]
+    fn a_padded_window_draws_its_lines_below_the_top_padding_and_nothing_else() {
+        let shared = padded("a\nb\nc\nd\ne\n", Some(1..3), TWELVE);
+        assert_eq!(shared.line_y(1), 12.0);
+        assert_eq!(
+            shared.visible_lines(),
+            1..3,
+            "no line outside the window is drawn"
+        );
+    }
+
+    #[test]
+    fn a_press_in_the_top_padding_lands_on_the_first_line() {
+        let mut shared = padded("one\ntwo\nthree\n", None, TWELVE);
+        assert_eq!(shared.hit_test(0.0, 4.0), 0);
+        let line = shared.metrics.line_height;
+        assert_eq!(
+            shared.hit_test(0.0, 12.0 + 1.5 * line),
+            4,
+            "a line and a half below the padding is the second line"
+        );
+    }
+
+    #[test]
+    fn the_text_area_leaves_out_the_side_padding() {
+        let shared = padded("one\n", None, TWELVE);
+        let bare = windowed("one\n", None);
+        assert_eq!(shared.text_area_width(), bare.text_area_width() - 24.0);
+        assert_eq!(shared.text_left(), 12.0 + shared.gutter_width());
+    }
+
+    #[test]
+    fn the_scrollbar_stays_at_the_right_edge() {
+        let shared = padded(&"line\n".repeat(100), None, TWELVE);
+        assert!(shared.over_scrollbar(shared.viewport.0 - 1.0, 100.0));
+        assert!(!shared.over_scrollbar(shared.viewport.0 - 30.0, 100.0));
+    }
+
+    #[test]
+    fn a_new_padding_at_the_same_size_is_reported() {
+        let mut shared = windowed("a\nb\n", None);
+        let reports = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = std::rc::Rc::clone(&reports);
+        shared.on_style = Some(std::rc::Rc::new(move |report| {
+            seen.borrow_mut().push(report)
+        }));
+        let style = zgui_css::StyleDraft::initial().build();
+        shared.read_style(&style, 1.0, (400.0, 400.0), true);
+        shared.set_insets(TWELVE);
+        shared.set_insets(TWELVE);
+        let reports = reports.borrow();
+        assert_eq!(reports.len(), 2, "the same padding is reported once");
+        assert_eq!(reports[1].insets, TWELVE);
     }
 
     #[test]
