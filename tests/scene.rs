@@ -367,6 +367,34 @@ fn a_wheel_glide_steps_every_frame_and_parks_at_its_target() {
     );
 }
 
+/// Turning smooth scrolling off on a mounted editor reaches the wheel: the next notch jumps.
+#[test]
+fn a_wheel_notch_jumps_once_smooth_scrolling_is_turned_off() {
+    let text: &'static str = Box::leak("line\n".repeat(200).into_boxed_str());
+    let (mut harness, handle) = mounted(text);
+    harness.settle(8);
+
+    handle.set_smooth_scroll(false);
+    harness.deliver_to_first(SurfaceEvent::Wheel {
+        event: zgui::vocab::WheelEvent {
+            delta: zgui::vocab::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+            phase: zgui::vocab::ScrollPhase::Discrete,
+            position: zgui::geom::Point::new(zgui::geom::CssPx(320.0), zgui::geom::CssPx(240.0)),
+            id: zgui::vocab::PointerId::MOUSE,
+            kind: zgui::vocab::PointerKind::Mouse,
+        },
+        modifiers: zgui::vocab::Modifiers::NONE,
+        timestamp: zgui::vocab::Timestamp::ORIGIN,
+    });
+    harness.settle(8);
+
+    let top = handle.scroll_state().get_untracked().top_line;
+    assert!(
+        (top - 3.0).abs() < 1e-9,
+        "one notch moves three lines at once: {top}"
+    );
+}
+
 /// A line scroll glides when the editor scrolls smoothly and jumps when it does not.
 #[test]
 fn a_line_scroll_glides_only_when_scrolling_is_smooth() {

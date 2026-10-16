@@ -668,12 +668,13 @@ pub fn Editor(
     let wheel = {
         let shared = Rc::clone(&shared);
         let handle = handle.clone();
-        let smooth = config.smooth_scroll;
-        let lines_per = config.scroll_lines;
         move |cx: &mut EventCx<'_, events::Wheel>| {
             let mut needs_glide = false;
             {
                 let mut shared = shared.borrow_mut();
+                // Read on every turn, so `EditorHandle::set_smooth_scroll` takes effect at once.
+                let smooth = shared.config.smooth_scroll;
+                let lines_per = shared.config.scroll_lines;
                 let before = (shared.scroll.target_line, shared.scroll.pos.x_px);
                 let total = shared.line_count();
                 let viewport = shared.viewport_lines();
