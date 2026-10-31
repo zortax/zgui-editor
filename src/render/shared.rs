@@ -346,6 +346,21 @@ impl EditorShared {
         Some((self.gutter_width() + (travel * position) as f32, width))
     }
 
+    /// Move the horizontal thumb by its left edge, clamped to the text track.
+    pub fn scroll_horizontal_thumb(&mut self, left: f64) {
+        let Some((_, width)) = self.horizontal_thumb() else {
+            return;
+        };
+        let area = self.text_area_width();
+        let travel = f64::from(area - width);
+        let fraction = if travel > 0.0 {
+            ((left - f64::from(self.gutter_width())) / travel).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.scroll.pos.x_px = fraction * f64::from((self.horizontal_extent() - area).max(0.0));
+    }
+
     /// How wide the gutter is.
     pub fn gutter_width(&self) -> f32 {
         gutter::width(

@@ -309,7 +309,12 @@ pub fn Editor(
             origin: std::ops::Range<usize>,
         },
         /// The scrollbar thumb, grabbed `grab` pixels below its own top.
-        Scrollbar { grab: f64 },
+        Scrollbar {
+            grab: f64,
+        },
+        HorizontalScrollbar {
+            grab: f64,
+        },
     }
 
     let clicks = Rc::new(RefCell::new(ClickCounter::new()));
@@ -392,6 +397,24 @@ pub fn Editor(
             // The scrollbar, before the text: it sits on top of it.
             {
                 let mut shared = shared.borrow_mut();
+                if y >= shared.viewport.1 - shared.scrollbar_width()
+                    && let Some((left, width)) = shared.horizontal_thumb()
+                {
+                    let grab = if x >= left && x < left + width {
+                        f64::from(x - left)
+                    } else {
+                        f64::from(width) / 2.0
+                    };
+                    shared.scroll_horizontal_thumb(f64::from(x) - grab);
+                    handle.update_signals(&mut shared);
+                    drop(shared);
+                    *drag.borrow_mut() = Some(Drag::HorizontalScrollbar { grab });
+                    over_scrollbar.set(true);
+                    handle.ctx.element.repaint();
+                    cx.capture_pointer();
+                    cx.stop_propagation();
+                    return;
+                }
                 let bar = shared.scrollbar();
                 if shared.config.scrollbar
                     && x >= shared.viewport.0 - shared.scrollbar_width()
@@ -535,8 +558,10 @@ pub fn Editor(
             let holding = drag.borrow();
             // The arrow over the bars, the I-beam over the text — and the arrow held through
             // a thumb drag wherever the pointer strays meanwhile.
-            let over = matches!(holding.as_ref(), Some(Drag::Scrollbar { .. }))
-                || (holding.is_none() && shared.borrow().over_scrollbar(x, y));
+            let over = matches!(
+                holding.as_ref(),
+                Some(Drag::Scrollbar { .. } | Drag::HorizontalScrollbar { .. })
+            ) || (holding.is_none() && shared.borrow().over_scrollbar(x, y));
             if over_scrollbar.get_untracked() != over {
                 over_scrollbar.set(over);
             }
@@ -551,6 +576,15 @@ pub fn Editor(
                     let total = shared.line_count();
                     let viewport = shared.viewport_lines();
                     shared.scroll.scroll_to(line, total, viewport);
+                    handle.update_signals(&mut shared);
+                    drop(shared);
+                    handle.ctx.element.repaint();
+                }
+                Some(Drag::HorizontalScrollbar { grab }) => {
+                    let grab = *grab;
+                    drop(holding);
+                    let mut shared = shared.borrow_mut();
+                    shared.scroll_horizontal_thumb(f64::from(x) - grab);
                     handle.update_signals(&mut shared);
                     drop(shared);
                     handle.ctx.element.repaint();
@@ -571,7 +605,13 @@ pub fn Editor(
 
                     // A pointer dragged past the edge keeps selecting: an interval scrolls the
                     // view toward it and re-extends until it comes back or lets go.
-                    let outside = y < 0.0 || y > shared.borrow().viewport.1;
+                    let outside = {
+                        let shared = shared.borrow();
+                        y < 0.0
+                            || y > shared.viewport.1
+                            || x < shared.gutter_width()
+                            || x > shared.viewport.0
+                    };
                     if outside && autoscroll.borrow().is_none() {
                         autoscroll_last.set(Instant::now());
                         let tick = {
@@ -601,8 +641,21 @@ pub fn Editor(
                                     } else if y > height {
                                         f64::from(y - height)
                                     } else {
-                                        return;
+                                        0.0
                                     };
+                                    let left = shared.gutter_width();
+                                    let width = shared.viewport.0;
+                                    let horizontal = if x < left {
+                                        f64::from(x - left)
+                                    } else {
+                                        f64::from((x - width).max(0.0))
+                                    };
+                                    let max_x = (f64::from(shared.horizontal_extent())
+                                        - f64::from(shared.text_area_width()))
+                                    .max(0.0);
+                                    shared.scroll.pos.x_px = (shared.scroll.pos.x_px
+                                        + horizontal * 12.0 * dt)
+                                        .clamp(0.0, max_x);
                                     let rate = crate::scroll::autoscroll_rate(
                                         overshoot.abs(),
                                         f64::from(shared.metrics.line_height),
@@ -612,7 +665,10 @@ pub fn Editor(
                                     let target = shared.scroll.pos.line + rate * dt;
                                     shared.scroll.scroll_to(target, total, viewport);
                                     handle.update_signals(&mut shared);
-                                    shared.hit_test(x, y.clamp(0.0, height))
+                                    shared.hit_test(
+                                        x.clamp(left.min(width), width),
+                                        y.clamp(0.0, height),
+                                    )
                                 };
                                 handle.command(Command::SetSelections {
                                     selections: vec![drag_selection(byte, granularity, &origin)],
@@ -647,7 +703,9 @@ pub fn Editor(
                         handle.command(Command::Copy(Clipboard::Primary));
                     }
                 }
-                Some(Drag::Scrollbar { .. }) => cx.release_pointer(),
+                Some(Drag::Scrollbar { .. } | Drag::HorizontalScrollbar { .. }) => {
+                    cx.release_pointer()
+                }
                 None => {}
             }
         }
@@ -675,7 +733,19 @@ pub fn Editor(
                 let line_height = f64::from(shared.metrics.line_height);
                 // The event is the web's `wheel`: a positive delta scrolls the view down and
                 // to the right, so deltas apply as they are.
-                match cx.delta {
+                let delta = match cx.delta {
+                    ScrollDelta::Lines { x, y } if cx.modifiers.shift() && x == 0.0 => {
+                        ScrollDelta::Lines { x: y, y: 0.0 }
+                    }
+                    ScrollDelta::Pixels(delta) if cx.modifiers.shift() && delta.width.0 == 0.0 => {
+                        ScrollDelta::Pixels(zgui::geom::Size::new(
+                            delta.height,
+                            zgui::geom::CssPx(0.0),
+                        ))
+                    }
+                    other => other,
+                };
+                match delta {
                     ScrollDelta::Lines { x, y } => {
                         let lines = f64::from(y) * lines_per;
                         if smooth {
