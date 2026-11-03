@@ -38,6 +38,13 @@ view! {
   custom property of its own, so diagnostics, search hits and git hunks replace one at a time.
   `point_for_byte` turns a byte into a place on the window, which is what a hover card, an inline
   diagnostic or a leap label is positioned by.
+- **Content between the lines.** Blocks reserve room under a line — `handle.set_blocks(layer,
+  blocks)` — and `handle.blocks()` publishes each block's rectangle on screen. The editor's
+  children are mounted in a layer over the text where those rectangles are measured, so a review
+  thread or an inline preview is any view an application builds, measured and given back as a
+  height. Scrolling, the scrollbar, the gutter, hit testing and line windows count the room; the
+  wheel over a block's content scrolls the editor, and presses and keys inside it stay its own —
+  see `examples/blocks.rs`.
 - **Mouse.** Click/drag selection with pointer capture and edge autoscroll, double-click word
   and triple-click line selection, middle-click primary-selection paste on Linux, scrollbar
   dragging.
@@ -86,6 +93,7 @@ rope, the selections, motion ranges, and search — and publishes signals (`curs
 cargo run --example basic --features lang-rust [-- path/to/file]
 cargo run --example vim --features lang-rust [-- path/to/file]
 cargo run --example completion --features lang-rust
+cargo run --example blocks --features lang-rust
 ```
 
 ## Known limitations

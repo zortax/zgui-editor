@@ -80,3 +80,7 @@ required-features = ["lang-rust"]
 [[example]]
 name = "completion"
 required-features = ["lang-rust"]
+
+[[example]]
+name = "blocks"
+required-features = ["lang-rust"]

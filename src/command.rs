@@ -71,10 +71,13 @@ pub enum InsertPoint {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ScrollCmd {
     /// By this many lines; positive scrolls the text up (toward later lines).
+    ///
+    /// Line heights of content: a [block](crate::block) passes by as its height, so a wheel notch
+    /// moves the same distance over a block as over text.
     Lines(f64),
     /// By this many viewports.
     Pages(f64),
-    /// Until `line` is the top line.
+    /// Until `line` is the top line, with the blocks above it counted.
     ToLine(usize),
     /// Until the primary caret's line is centered.
     CursorCenter,
@@ -88,7 +91,10 @@ pub enum ScrollCmd {
     ///
     /// What puts a view back where a session left it.
     ToExact {
-        /// The line at the top, fractionally.
+        /// The line at the top, fractionally, as [`ScrollSnapshot::top_line`] reports it: with
+        /// [blocks](crate::block), in rows that count each block as its height.
+        ///
+        /// [`ScrollSnapshot::top_line`]: crate::ScrollSnapshot::top_line
         line: f64,
         /// How far the text is scrolled left, in device pixels.
         x_px: f64,
