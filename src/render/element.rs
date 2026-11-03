@@ -42,8 +42,9 @@ impl CustomElement for EditorElement {
         let height = {
             let mut shared = self.shared.borrow_mut();
             shared.read_style(cx.style, cx.scale, (width, height), false);
-            match (cx.known_height, shared.line_window()) {
-                (None, Some(window)) => window.len() as f32 * shared.metrics.line_height,
+            // The blocks under the window's lines are part of what it draws.
+            match (cx.known_height, shared.window_height()) {
+                (None, Some(window)) => window,
                 _ => height,
             }
         };

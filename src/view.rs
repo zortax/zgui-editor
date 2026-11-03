@@ -35,8 +35,24 @@ zgui::style! { pub EditorStyle =>
     }"
 }
 
+zgui::style! { pub BlockLayerStyle =>
+// The box block content is placed in: the editor's padding box, over the text. It takes no
+// pointer events, so the text under it is pressed as if it were not there; what the application
+// mounted in it takes them again.
+":scope {
+        position: relative;
+        pointer-events: none;
+        overflow: hidden;
+        cursor: default;
+    }"
+":scope > * { pointer-events: auto; }"
+}
+
 /// The stylesheet's registered name.
 const SHEET: &str = "zgui-editor";
+
+/// The block layer's stylesheet's registered name.
+const BLOCK_SHEET: &str = "zgui-editor-blocks";
 
 /// How often the caret blinks, each way.
 const BLINK_INTERVAL: Duration = Duration::from_millis(500);
@@ -49,6 +65,10 @@ const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 /// scrollbars stay at the edges, and scrolled text moves through it. Everything an application
 /// does to it goes through the [`EditorHandle`] delivered by `on_ready` (and through local
 /// context); everything modal — a vim layer — is built on `on_key`, which hears every key first.
+///
+/// Its children, when it has any, are mounted in a layer over the text that is exactly the
+/// padding box: the box [`EditorHandle::blocks`] measures block rectangles in. See
+/// [`block`](crate::block).
 #[component]
 #[allow(clippy::too_many_arguments)]
 pub fn Editor(
@@ -96,6 +116,13 @@ pub fn Editor(
     /// Anything else the caller forwarded.
     #[prop(attrs)]
     attrs: Attrs,
+    /// What is mounted over the text, in the padding box: the content of the
+    /// [blocks](crate::block), placed at the rectangles [`EditorHandle::blocks`] publishes.
+    ///
+    /// The layer takes no pointer events; its direct children take them again. A wheel turn over
+    /// the content scrolls the editor, while presses, keys and focus inside it stay the content's.
+    #[prop(optional)]
+    children: Option<Children>,
 ) -> impl IntoView {
     install_stylesheet(SHEET, EditorStyle::CSS);
     let config = config.unwrap_or_default();
@@ -115,6 +142,10 @@ pub fn Editor(
     let (frame_view, frame_handle) = zgui::custom::custom(EditorFrame::new(Rc::clone(&shared)));
     let port = NodeRef::new();
     let canvas = NodeRef::new();
+    // The layer the block content is mounted in. Anything that happens inside it is the
+    // content's, not the editor's.
+    let layer = NodeRef::new();
+    let from_layer = move |target: zgui::view::NodeId| layer.contains(target);
     let clipboards = try_use_clipboard();
 
     let registry =
@@ -285,7 +316,7 @@ pub fn Editor(
         let handle = handle.clone();
         let on_key = on_key;
         move |cx: &mut EventCx<'_, events::KeyDown>| {
-            if !focusable {
+            if !focusable || from_layer(cx.target) {
                 return;
             }
             let event: zgui::vocab::KeyEvent = (*cx).clone();
@@ -388,9 +419,18 @@ pub fn Editor(
         let clicks = Rc::clone(&clicks);
         let drag = Rc::clone(&drag);
         move |cx: &mut EventCx<'_, events::PointerDown>| {
+            // A press on block content is the content's; one on the empty room of a block is
+            // nobody's, and moves neither the caret nor the focus.
+            if from_layer(cx.target) {
+                return;
+            }
             let Some((x, y)) = local_point(cx.position) else {
                 return;
             };
+            let over_bar = shared.borrow().over_scrollbar(x, y);
+            if !over_bar && shared.borrow().block_at(x, y).is_some() {
+                return;
+            }
             // A secondary press takes the focus unless the config leaves it where it is, for a
             // menu an ancestor opens over the editor.
             let secondary = cx.button == Some(PointerButton::Secondary);
@@ -414,7 +454,7 @@ pub fn Editor(
                         height / 2.0
                     };
                     let line = bar.line_at(f64::from(y) - grab);
-                    let total = shared.line_count();
+                    let total = shared.total_rows();
                     let viewport = shared.viewport_lines();
                     shared.scroll.scroll_to(line, total, viewport);
                     handle.update_signals(&mut shared);
@@ -541,6 +581,10 @@ pub fn Editor(
             };
             drag_point.set((x, y));
             let holding = drag.borrow();
+            // Over block content with nothing held, the pointer is the content's.
+            if holding.is_none() && from_layer(cx.target) {
+                return;
+            }
             // The arrow over the bars, the I-beam over the text — and the arrow held through
             // a thumb drag wherever the pointer strays meanwhile.
             let over = matches!(holding.as_ref(), Some(Drag::Scrollbar { .. }))
@@ -556,7 +600,7 @@ pub fn Editor(
                     let mut shared = shared.borrow_mut();
                     let bar = shared.scrollbar();
                     let line = bar.line_at(f64::from(y) - grab);
-                    let total = shared.line_count();
+                    let total = shared.total_rows();
                     let viewport = shared.viewport_lines();
                     shared.scroll.scroll_to(line, total, viewport);
                     handle.update_signals(&mut shared);
@@ -616,7 +660,7 @@ pub fn Editor(
                                         overshoot.abs(),
                                         f64::from(shared.metrics.line_height),
                                     ) * overshoot.signum();
-                                    let total = shared.line_count();
+                                    let total = shared.total_rows();
                                     let viewport = shared.viewport_lines();
                                     let target = shared.scroll.pos.line + rate * dt;
                                     shared.scroll.scroll_to(target, total, viewport);
@@ -681,7 +725,7 @@ pub fn Editor(
                 let smooth = shared.config.smooth_scroll;
                 let lines_per = shared.config.scroll_lines;
                 let before = (shared.scroll.target_line, shared.scroll.pos.x_px);
-                let total = shared.line_count();
+                let total = shared.total_rows();
                 let viewport = shared.viewport_lines();
                 let line_height = f64::from(shared.metrics.line_height);
                 // The event is the web's `wheel`: a positive delta scrolls the view down and
@@ -747,7 +791,11 @@ pub fn Editor(
         let blink = Rc::clone(&blink);
         let blinking = config.blink;
         let clock = clock.clone();
-        move |_: &mut EventCx<'_, events::FocusIn>| {
+        move |cx: &mut EventCx<'_, events::FocusIn>| {
+            // Focus moving inside the block content is not the editor's.
+            if from_layer(cx.target) {
+                return;
+            }
             {
                 let mut shared = shared.borrow_mut();
                 shared.focused = true;
@@ -775,7 +823,10 @@ pub fn Editor(
         let shared = Rc::clone(&shared);
         let handle = handle.clone();
         let blink = Rc::clone(&blink);
-        move |_: &mut EventCx<'_, events::FocusOut>| {
+        move |cx: &mut EventCx<'_, events::FocusOut>| {
+            if from_layer(cx.target) {
+                return;
+            }
             {
                 let mut shared = shared.borrow_mut();
                 shared.focused = false;
@@ -803,6 +854,20 @@ pub fn Editor(
     }
     provide_local_context(handle.clone());
 
+    // The layer goes after the drawing element, so it is painted over the text.
+    let frame_view = frame_view.child(element_view.node_ref(canvas));
+    let frame_view = match children {
+        Some(children) => {
+            install_stylesheet(BLOCK_SHEET, BlockLayerStyle::CSS);
+            frame_view.child(view! {
+                box(class = BlockLayerStyle::CLASS, class = "editor__blocks", node_ref = layer) {
+                    {children.into_view_once()}
+                }
+            })
+        }
+        None => frame_view,
+    };
+
     // Built by hand: the root is a custom element, which `view!` has no tag for.
     AnyView::new(
         frame_view
@@ -826,7 +891,6 @@ pub fn Editor(
             .on(events::WHEEL, wheel)
             .on(events::FOCUS_IN, focus_in)
             .on(events::FOCUS_OUT, focus_out)
-            .attrs(attrs)
-            .child(element_view.node_ref(canvas)),
+            .attrs(attrs),
     )
 }

@@ -46,6 +46,15 @@
 //! [`styles`] puts colours, weights, slants and lines on stretches of the text over the
 //! highlighter, which is what terminal output is shown with.
 //!
+//! # Content between the lines
+//!
+//! A [`block`] is room under a line, as tall as the application asks, that the editor leaves empty
+//! for content of the application's own: a review thread under the line it is about, an inline
+//! preview. [`EditorHandle::set_blocks`] reserves it, [`EditorHandle::blocks`] publishes where each
+//! block is on screen, and the editor's children are mounted in a layer over the text where those
+//! rectangles are measured. Scrolling, the gutter, hit testing and a window's height all count the
+//! room as content.
+//!
 //! # A view of one part of a document
 //!
 //! [`EditorConfig::line_window`] makes the view draw exactly the lines it names and size itself to
@@ -62,6 +71,7 @@
 #![warn(missing_docs)]
 #![forbid(unsafe_code)]
 
+pub mod block;
 pub mod command;
 pub mod config;
 pub mod core;
@@ -78,6 +88,7 @@ pub mod styles;
 pub mod syntax;
 mod view;
 
+pub use crate::block::{Block, BlockId, BlockRect};
 pub use crate::command::{Clipboard, Command, InsertPoint, Motion, ScrollCmd};
 pub use crate::config::{CopyTarget, CursorStyle, EditorConfig, GutterMode, PasteSource};
 pub use crate::core::edit::{Edit, EditKind, EditTime, TextChange, Transaction};

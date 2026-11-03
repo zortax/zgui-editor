@@ -14,6 +14,7 @@ use zgui::platform::ClipboardKind;
 use zgui::prelude::*;
 use zgui::runtime::clipboard::Clipboards;
 
+use crate::block::{Block, BlockRect};
 use crate::command::{Clipboard, Command, InsertPoint, Motion, ScrollCmd};
 use crate::config::{CopyTarget, CursorStyle, GutterMode, PasteSource};
 use crate::core::motion::{self, MotionContext};
@@ -45,6 +46,9 @@ pub struct CursorPos {
 pub struct ScrollSnapshot {
     /// The line at the top of the view, fractionally, right now.
     ///
+    /// With [blocks](crate::block) this is a row: one line height of content, where a block
+    /// counts as its height in rows. Without blocks a row is a line.
+    ///
     /// Mid-glide this is where the view has reached, which is what a scrollbar draws and what
     /// anything writing the position down should *not* use: see [`Self::target_line`].
     pub top_line: f64,
@@ -53,9 +57,9 @@ pub struct ScrollSnapshot {
     /// What to write down. A jump glides, so the moment a scroll is reported the view has barely
     /// begun to move, and the position recorded then would be the one it was leaving.
     pub target_line: f64,
-    /// The greatest top line the document allows.
+    /// The greatest top line the document allows, in rows like the top line.
     pub max_top: f64,
-    /// How many lines the view shows.
+    /// How many lines the view shows, in rows like the top line.
     pub viewport_lines: f64,
     /// How far the text is scrolled left, in device pixels.
     ///
@@ -191,6 +195,7 @@ pub(crate) struct HandleSignals {
     pub selection: RwSignal<Selection, LocalStorage>,
     pub scroll: RwSignal<ScrollSnapshot, LocalStorage>,
     pub caret_rect: RwSignal<Option<CaretRect>, LocalStorage>,
+    pub blocks: RwSignal<Vec<BlockRect>, LocalStorage>,
 }
 
 impl HandleSignals {
@@ -201,6 +206,7 @@ impl HandleSignals {
             selection: RwSignal::new_local(Selection::caret(0)),
             scroll: RwSignal::new_local(ScrollSnapshot::default()),
             caret_rect: RwSignal::new_local(None),
+            blocks: RwSignal::new_local(Vec::new()),
         }
     }
 }
@@ -475,6 +481,54 @@ impl EditorHandle {
     pub fn clear_gutter_marks(&self, layer: &str) {
         let changed = self.ctx.shared.borrow_mut().gutter_marks.clear(layer);
         self.after_marks(changed, false);
+    }
+
+    /// Replaces the blocks in the layer called `layer`: room under lines for content of the
+    /// application's own. See [`block`](crate::block).
+    ///
+    /// Layered as [`set_decorations`](Self::set_decorations) is, so a review's threads and an
+    /// inline preview replace one at a time. Setting what a layer already holds costs nothing,
+    /// which is what lets an application give a measured height back on every resize. The text at
+    /// the top of the view stays where it is when a block above it changes height.
+    ///
+    /// A windowed view lays out again, because its blocks are part of how tall it is; any other
+    /// view paints again and publishes the new rectangles through [`blocks`](Self::blocks).
+    pub fn set_blocks(&self, layer: &str, blocks: Vec<Block>) {
+        let changed = self.ctx.shared.borrow_mut().set_blocks(layer, blocks);
+        self.after_blocks(changed);
+    }
+
+    /// Removes the block layer called `layer` and the room it took.
+    pub fn clear_blocks(&self, layer: &str) {
+        let changed = self.ctx.shared.borrow_mut().clear_blocks(layer);
+        self.after_blocks(changed);
+    }
+
+    /// Where every block on screen is, in CSS pixels from the corner of the editor's padding box.
+    ///
+    /// That box is the layer the editor's children are mounted in, so a child placed with
+    /// `position: absolute` at a rectangle's `x` and `y` sits on its block. Moves with every
+    /// scroll step and every change to the blocks, the text or the size; a block leaves the list
+    /// when it scrolls out of view and comes back when it scrolls in.
+    pub fn blocks(&self) -> Signal<Vec<BlockRect>, LocalStorage> {
+        self.ctx.signals.blocks.into()
+    }
+
+    /// Asks for whatever a changed set of blocks needs.
+    fn after_blocks(&self, changed: bool) {
+        if !changed {
+            return;
+        }
+        let windowed = {
+            let mut shared = self.ctx.shared.borrow_mut();
+            self.update_signals(&mut shared);
+            shared.line_window().is_some()
+        };
+        if windowed {
+            self.ctx.relayout();
+        } else {
+            self.ctx.element.repaint();
+        }
     }
 
     /// Asks for whatever a changed set of marks needs.
@@ -770,7 +824,8 @@ impl EditorHandle {
     /// Which byte a place on the window lands on, in CSS pixels. `None` when it is outside.
     ///
     /// The inverse of [`point_for_byte`](Self::point_for_byte), and what a click in a decoration
-    /// an application drew over the editor has to be turned back into.
+    /// an application drew over the editor has to be turned back into. A place inside a
+    /// [block](crate::block) is no byte.
     pub fn byte_for_point(&self, x: f32, y: f32) -> Option<usize> {
         let bounds = self.ctx.canvas.window_bounds()?;
         let mut shared = self.ctx.shared.borrow_mut();
@@ -782,6 +837,9 @@ impl EditorHandle {
             || local_x > shared.viewport.0
             || local_y > shared.viewport.1
         {
+            return None;
+        }
+        if shared.block_at(local_x, local_y).is_some() {
             return None;
         }
         Some(shared.hit_test(local_x, local_y))
@@ -863,9 +921,10 @@ impl EditorHandle {
                 });
             }
             let top = shared.scroll.pos.line;
+            let top_line = shared.line_at_row(top);
             shared.absorb_change(change);
             if !change.whole_text && shared.line_window().is_none() {
-                pin(&mut shared, change, top);
+                pin(&mut shared, change, top, top_line);
             }
             self.update_signals(&mut shared);
         }
@@ -983,14 +1042,20 @@ impl EditorHandle {
             Some(caret) => (caret.line, shared.cell_x(caret.line, caret.column)),
             None => shared.caret_position(shared.selections.primary().head),
         };
-        let total = shared.line_count();
+        let total = shared.total_rows();
         let viewport = shared.viewport_lines();
-        let scrolloff = shared.config.scrolloff;
+        // The margin is whole lines, as many as fit around the caret's line, and the rows it
+        // spans count whatever blocks sit between those lines.
+        let fits = ((viewport - 1.0) / 2.0).max(0.0).floor() as usize;
+        let margin = shared.config.scrolloff.min(fits);
+        let last = shared.line_count().saturating_sub(1);
+        let top = shared.row_of_line(line.saturating_sub(margin));
+        let bottom = shared.row_of_line((line + margin).min(last)) + 1.0;
 
         // Probe on a copy: where would the view have to sit? Then decide how to get there.
         let before = shared.scroll.pos.line;
         let mut probe = shared.scroll;
-        if probe.ensure_visible(line, scrolloff, total, viewport) {
+        if probe.ensure_span_visible(top, bottom, total, viewport) {
             let distance = (probe.pos.line - before).abs();
             if shared.config.smooth_scroll && distance > shared.config.glide_threshold_lines {
                 shared.scroll.target_line = probe.pos.line;
@@ -1009,7 +1074,7 @@ impl EditorHandle {
 
     /// Aims the view at `line` as its top: gliding when the editor scrolls smoothly, snapping
     /// otherwise.
-    fn aim(&self, shared: &mut EditorShared, line: f64, total: usize, viewport: f64) {
+    fn aim(&self, shared: &mut EditorShared, line: f64, total: f64, viewport: f64) {
         if shared.config.smooth_scroll {
             shared.scroll.target_line =
                 line.clamp(0.0, crate::scroll::ScrollState::max_top(total, viewport));
@@ -1020,7 +1085,7 @@ impl EditorHandle {
 
     /// Moves the view `lines` further: gliding when the editor scrolls smoothly, snapping
     /// otherwise.
-    fn shift(&self, shared: &mut EditorShared, lines: f64, total: usize, viewport: f64) {
+    fn shift(&self, shared: &mut EditorShared, lines: f64, total: f64, viewport: f64) {
         if shared.config.smooth_scroll {
             shared.scroll.scroll_by(lines, total, viewport);
         } else {
@@ -1031,28 +1096,30 @@ impl EditorHandle {
 
     /// Applies an explicit scroll command.
     fn apply_scroll(&self, shared: &mut EditorShared, command: ScrollCmd) {
-        let total = shared.line_count();
+        let total = shared.total_rows();
         let viewport = shared.viewport_lines();
-        let caret_line = position::line_of(&shared.rope(), shared.selections.primary().head) as f64;
+        let caret_line = position::line_of(&shared.rope(), shared.selections.primary().head);
+        let caret_row = shared.row_of_line(caret_line);
+        let last = shared.line_count().saturating_sub(1);
         match command {
             ScrollCmd::Lines(lines) => self.shift(shared, lines, total, viewport),
             ScrollCmd::Pages(pages) => self.shift(shared, pages * viewport, total, viewport),
-            ScrollCmd::ToLine(line) => shared.scroll.scroll_to(line as f64, total, viewport),
+            ScrollCmd::ToLine(line) => {
+                let row = shared.row_of_line(line);
+                shared.scroll.scroll_to(row, total, viewport);
+            }
             ScrollCmd::CursorCenter => {
-                self.aim(shared, caret_line - viewport / 2.0, total, viewport)
+                self.aim(shared, caret_row - viewport / 2.0, total, viewport)
             }
             ScrollCmd::CursorTop => {
-                let margin = shared.config.scrolloff as f64;
-                self.aim(shared, caret_line - margin, total, viewport)
+                let margin = shared.config.scrolloff;
+                let row = shared.row_of_line(caret_line.saturating_sub(margin));
+                self.aim(shared, row, total, viewport)
             }
             ScrollCmd::CursorBottom => {
-                let margin = shared.config.scrolloff as f64;
-                self.aim(
-                    shared,
-                    caret_line - viewport + 1.0 + margin,
-                    total,
-                    viewport,
-                )
+                let margin = shared.config.scrolloff;
+                let row = shared.row_of_line((caret_line + margin).min(last)) + 1.0;
+                self.aim(shared, row - viewport, total, viewport)
             }
             ScrollCmd::HorizontalPx(px) => {
                 let text_width = f64::from(shared.text_area_width());
@@ -1084,7 +1151,7 @@ impl EditorHandle {
         self.ctx.signals.revision.set(shared.revision());
         self.ctx.signals.cursor.set(CursorPos { line, col });
         self.ctx.signals.selection.set(primary);
-        let total = position::line_count(&rope);
+        let total = shared.total_rows();
         let viewport = shared.viewport_lines();
         self.ctx.signals.scroll.set(ScrollSnapshot {
             top_line: shared.scroll.pos.line,
@@ -1094,6 +1161,16 @@ impl EditorHandle {
             x_px: shared.scroll.pos.x_px,
         });
         self.ctx.signals.caret_rect.set(self.caret_rect_now(shared));
+        // Set only when different: an application re-places its block content on every change.
+        let blocks = shared.block_rects();
+        if self
+            .ctx
+            .signals
+            .blocks
+            .with_untracked(|held| *held != blocks)
+        {
+            self.ctx.signals.blocks.set(blocks);
+        }
 
         // The worker follows the viewport, asked again only when the view has moved far
         // enough that the overscan it was given is running out.
@@ -1144,17 +1221,17 @@ impl EditorHandle {
 ///
 /// A view that stood at `top` before `change` moves by as many lines as the change added or
 /// removed above that line, so the reader goes on reading the same text.
-fn pin(shared: &mut EditorShared, change: &ChangeInfo, top: f64) {
+fn pin(shared: &mut EditorShared, change: &ChangeInfo, top: f64, top_line: usize) {
     let above: isize = change
         .input_edits
         .iter()
-        .filter(|edit| (edit.old_end_position.row as f64) < top.floor())
+        .filter(|edit| edit.old_end_position.row < top_line)
         .map(|edit| edit.new_end_position.row as isize - edit.old_end_position.row as isize)
         .sum();
     if above == 0 {
         return;
     }
-    let total = shared.line_count();
+    let total = shared.total_rows();
     let viewport = shared.viewport_lines();
     let moved = above as f64;
     let target = shared.scroll.target_line + moved;

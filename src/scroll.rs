@@ -4,11 +4,16 @@
 //! ten-million-line file scrolls to pixel precision, which is the reason the framework's own
 //! scroll container (whose offsets are `f32` device pixels) is not used. Everything here is
 //! arithmetic: the animation timer and the repaint belong to the view.
+//!
+//! The unit is a *row*: one line height of content. Without [blocks](crate::block) a row is a
+//! line and the two numbers are the same. A block counts as its height in rows, so a total
+//! passed here is the content's height in line heights, which need not be whole.
 
 /// Where the view sits.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ScrollPos {
-    /// The line at the top of the view, fractionally: 2.5 is half-way down line two.
+    /// The row at the top of the view, fractionally: 2.5 is half-way down line two when no block
+    /// sits above it.
     pub line: f64,
     /// How far the text is scrolled left, in device pixels.
     pub x_px: f64,
@@ -19,7 +24,7 @@ pub struct ScrollPos {
 pub struct ScrollState {
     /// Where the view is.
     pub pos: ScrollPos,
-    /// The line the glide is heading for; equal to `pos.line` at rest.
+    /// The row the glide is heading for; equal to `pos.line` at rest.
     pub target_line: f64,
 }
 
@@ -33,18 +38,18 @@ const GLIDE_TAU: f64 = 0.075;
 const GLIDE_DONE: f64 = 0.002;
 
 impl ScrollState {
-    /// The greatest top line a document of `total` lines allows a view of `viewport` lines.
-    pub fn max_top(total: usize, viewport: f64) -> f64 {
-        (total as f64 - viewport).max(0.0)
+    /// The greatest top row content `total` rows tall allows a view of `viewport` rows.
+    pub fn max_top(total: f64, viewport: f64) -> f64 {
+        (total - viewport).max(0.0)
     }
 
     /// Aims the glide `lines` further, clamped to the document.
-    pub fn scroll_by(&mut self, lines: f64, total: usize, viewport: f64) {
+    pub fn scroll_by(&mut self, lines: f64, total: f64, viewport: f64) {
         self.target_line = (self.target_line + lines).clamp(0.0, Self::max_top(total, viewport));
     }
 
     /// Moves the view immediately, target and all, as a trackpad's pixel deltas want.
-    pub fn scroll_to(&mut self, line: f64, total: usize, viewport: f64) {
+    pub fn scroll_to(&mut self, line: f64, total: f64, viewport: f64) {
         let line = line.clamp(0.0, Self::max_top(total, viewport));
         self.pos.line = line;
         self.target_line = line;
@@ -70,22 +75,37 @@ impl ScrollState {
     /// Moves the view so line `line` is visible with `margin` lines around it, immediately.
     ///
     /// Immediately, because this follows the caret, and a caret that outruns its view while
-    /// typing is worse than a jump. Answers whether anything moved.
+    /// typing is worse than a jump. Answers whether anything moved. For content without blocks,
+    /// where a line is a row.
     pub fn ensure_visible(
         &mut self,
         line: usize,
         margin: usize,
-        total: usize,
+        total: f64,
         viewport: f64,
     ) -> bool {
         let line = line as f64;
         let margin = (margin as f64).min(((viewport - 1.0) / 2.0).max(0.0));
-        let top = self.pos.line;
-        let bottom = top + viewport - 1.0;
-        let new_top = if line - margin < top {
-            line - margin
-        } else if line + margin > bottom {
-            line + margin - viewport + 1.0
+        self.ensure_span_visible(line - margin, line + margin + 1.0, total, viewport)
+    }
+
+    /// Moves the view so the rows from `top` to `bottom` are inside it, immediately.
+    ///
+    /// The least move that does it: a span above the view comes in at the top, one below at the
+    /// bottom. A span taller than the view shows its top. Answers whether anything moved.
+    pub fn ensure_span_visible(
+        &mut self,
+        top: f64,
+        bottom: f64,
+        total: f64,
+        viewport: f64,
+    ) -> bool {
+        let view_top = self.pos.line;
+        let view_bottom = view_top + viewport;
+        let new_top = if top < view_top {
+            top
+        } else if bottom > view_bottom {
+            (bottom - viewport).min(top)
         } else {
             return false;
         };
@@ -115,9 +135,9 @@ impl ScrollState {
 pub struct Scrollbar {
     /// How tall the track is, in device pixels.
     pub track: f64,
-    /// How many lines the document has.
-    pub total: usize,
-    /// How many lines the view shows.
+    /// How many rows the content has.
+    pub total: f64,
+    /// How many rows the view shows.
     pub viewport: f64,
 }
 
@@ -131,13 +151,13 @@ impl Scrollbar {
         if max_top <= 0.0 || self.track <= 0.0 {
             return None;
         }
-        let span = (self.viewport / self.total as f64).clamp(0.0, 1.0);
+        let span = (self.viewport / self.total).clamp(0.0, 1.0);
         let height = (self.track * span).max(MIN_THUMB).min(self.track);
         let position = (top / max_top).clamp(0.0, 1.0);
         Some(((self.track - height) * position, height))
     }
 
-    /// The top line a thumb dragged so its own top sits at `y` asks for.
+    /// The top row a thumb dragged so its own top sits at `y` asks for.
     pub fn line_at(&self, y: f64) -> f64 {
         let Some((_, height)) = self.thumb(0.0) else {
             return 0.0;
@@ -161,7 +181,7 @@ mod tests {
     #[test]
     fn the_glide_converges_and_stops() {
         let mut scroll = ScrollState::default();
-        scroll.scroll_by(100.0, 1000, 40.0);
+        scroll.scroll_by(100.0, 1000.0, 40.0);
         let mut steps = 0;
         while scroll.step(0.008) {
             steps += 1;
@@ -174,47 +194,78 @@ mod tests {
     #[test]
     fn scrolling_clamps_to_the_document() {
         let mut scroll = ScrollState::default();
-        scroll.scroll_by(-10.0, 100, 40.0);
+        scroll.scroll_by(-10.0, 100.0, 40.0);
         assert_eq!(scroll.target_line, 0.0);
-        scroll.scroll_by(1000.0, 100, 40.0);
+        scroll.scroll_by(1000.0, 100.0, 40.0);
         assert_eq!(scroll.target_line, 60.0);
     }
 
     #[test]
     fn a_short_document_does_not_scroll() {
         let mut scroll = ScrollState::default();
-        scroll.scroll_by(10.0, 5, 40.0);
+        scroll.scroll_by(10.0, 5.0, 40.0);
         assert_eq!(scroll.target_line, 0.0);
     }
 
     #[test]
     fn ensure_visible_moves_only_when_needed() {
         let mut scroll = ScrollState::default();
-        assert!(!scroll.ensure_visible(10, 0, 1000, 40.0), "already visible");
-        assert!(scroll.ensure_visible(50, 0, 1000, 40.0));
+        assert!(
+            !scroll.ensure_visible(10, 0, 1000.0, 40.0),
+            "already visible"
+        );
+        assert!(scroll.ensure_visible(50, 0, 1000.0, 40.0));
         assert_eq!(scroll.pos.line, 11.0, "the line sits at the bottom edge");
-        assert!(scroll.ensure_visible(5, 0, 1000, 40.0));
+        assert!(scroll.ensure_visible(5, 0, 1000.0, 40.0));
         assert_eq!(scroll.pos.line, 5.0, "the line sits at the top edge");
     }
 
     #[test]
     fn ensure_visible_honours_the_margin() {
         let mut scroll = ScrollState::default();
-        assert!(scroll.ensure_visible(39, 3, 1000, 40.0));
+        assert!(scroll.ensure_visible(39, 3, 1000.0, 40.0));
         assert_eq!(scroll.pos.line, 3.0);
+    }
+
+    #[test]
+    fn a_span_comes_in_at_the_nearer_edge() {
+        let mut scroll = ScrollState::default();
+        assert!(
+            !scroll.ensure_span_visible(2.0, 3.0, 1000.0, 40.0),
+            "already visible"
+        );
+        assert!(scroll.ensure_span_visible(50.0, 53.5, 1000.0, 40.0));
+        assert_eq!(
+            scroll.pos.line, 13.5,
+            "the bottom of the span at the bottom edge"
+        );
+        assert!(scroll.ensure_span_visible(4.25, 5.25, 1000.0, 40.0));
+        assert_eq!(scroll.pos.line, 4.25, "the top of the span at the top edge");
+        assert!(scroll.ensure_span_visible(100.0, 200.0, 1000.0, 40.0));
+        assert_eq!(
+            scroll.pos.line, 100.0,
+            "a span taller than the view shows its top"
+        );
+    }
+
+    #[test]
+    fn rows_that_are_not_whole_lines_clamp_to_their_own_end() {
+        let mut scroll = ScrollState::default();
+        scroll.scroll_to(1000.0, 102.5, 40.0);
+        assert_eq!(scroll.pos.line, 62.5);
     }
 
     #[test]
     fn the_thumb_travels_the_whole_track() {
         let bar = Scrollbar {
             track: 800.0,
-            total: 10_000,
+            total: 10_000.0,
             viewport: 40.0,
         };
         let (top, height) = bar.thumb(0.0).expect("a thumb");
         assert_eq!(top, 0.0);
         assert!(height >= MIN_THUMB);
-        let max = ScrollState::max_top(10_000, 40.0);
+        let max = ScrollState::max_top(10_000.0, 40.0);
         let (top, height) = bar.thumb(max).expect("a thumb");
         assert!((top + height - 800.0).abs() < 0.5);
     }
@@ -223,11 +274,11 @@ mod tests {
     fn dragging_maps_back_to_lines() {
         let bar = Scrollbar {
             track: 800.0,
-            total: 10_000,
+            total: 10_000.0,
             viewport: 40.0,
         };
         assert_eq!(bar.line_at(0.0), 0.0);
-        let max = ScrollState::max_top(10_000, 40.0);
+        let max = ScrollState::max_top(10_000.0, 40.0);
         assert!((bar.line_at(800.0) - max).abs() < 0.01);
     }
 
@@ -235,7 +286,7 @@ mod tests {
     fn a_full_view_shows_no_thumb() {
         let bar = Scrollbar {
             track: 800.0,
-            total: 10,
+            total: 10.0,
             viewport: 40.0,
         };
         assert!(bar.thumb(0.0).is_none());

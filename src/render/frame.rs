@@ -2,7 +2,8 @@
 //!
 //! The frame is the component's root. It reads its own padding and border, gives its padding box
 //! to the [`EditorElement`](crate::render::element::EditorElement) inside it, and stores the
-//! padding in [`EditorShared`]. The editor then draws the way a CSS scroll container does: the
+//! padding in [`EditorShared`]. The layer an application's [block](crate::block) content is
+//! mounted in, when there is one, gets the same box over the element. The editor then draws the way a CSS scroll container does: the
 //! scrollbars at the padding box's edges, the text inset by the padding, and scrolled text
 //! moving through the padding up to the frame's clip.
 
@@ -66,17 +67,21 @@ impl CustomElement for EditorFrame {
             },
         };
 
-        if cx.final_pass && cx.access.child_count() > 0 {
+        // The drawing element first, then the layer the application's block content is mounted
+        // in, over it and exactly as big: the box a block's rectangle is measured in.
+        if cx.final_pass {
             let padded_height = height + padding.top + padding.bottom;
-            cx.access.layout_child(
-                0,
-                (Some(padded_width), Some(padded_height)),
-                (
-                    Space::Definite(padded_width),
-                    Space::Definite(padded_height),
-                ),
-            );
-            cx.access.place_child(0, border.left, border.top);
+            for index in 0..cx.access.child_count() {
+                cx.access.layout_child(
+                    index,
+                    (Some(padded_width), Some(padded_height)),
+                    (
+                        Space::Definite(padded_width),
+                        Space::Definite(padded_height),
+                    ),
+                );
+                cx.access.place_child(index, border.left, border.top);
+            }
         }
         CustomMeasured {
             width,

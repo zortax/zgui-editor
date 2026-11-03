@@ -20,6 +20,7 @@ use zgui::geom::{Device, DevicePx, Point, Rect, Size};
 use zgui_css::ComputedStyle;
 use zgui_interned::Ident;
 
+use crate::block::{Block, BlockMap, BlockRect, Spot};
 use crate::config::{CursorStyle, EditorConfig, GutterMode};
 use crate::core::motion::MotionContext;
 use crate::core::position;
@@ -116,6 +117,8 @@ pub struct EditorShared {
     pub gutter_marks: Layers<GutterMark>,
     /// What a custom gutter's labels are, when the application draws the gutter.
     pub gutter_source: Option<GutterSource>,
+    /// The room the application reserved between lines.
+    pub(crate) blocks: BlockMap,
     /// The colours those marks named, as the style sheet answers for them.
     ///
     /// A name present with `None` is one the sheet does not set, which is different from one that
@@ -182,6 +185,7 @@ impl EditorShared {
             decorations: Layers::default(),
             gutter_marks: Layers::default(),
             gutter_source: None,
+            blocks: BlockMap::default(),
             decoration_colors: rustc_hash::FxHashMap::default(),
             syntax_tx: None,
             requested_window: 0..0,
@@ -259,6 +263,15 @@ impl EditorShared {
             }
         }
 
+        // The room under the lines moves with them. A replaced text has nothing to follow, so
+        // its blocks stay where they were, clamped to what the new text has.
+        let (scale, total) = (self.metrics.scale, self.line_count());
+        if change.whole_text {
+            self.blocks.ensure(scale, total);
+        } else {
+            self.blocks.follow(&change.input_edits, scale, total);
+        }
+
         if let Some(tx) = self.syntax_tx.as_ref() {
             let (snapshot, revision) = self.document.state().snapshot();
             // A replaced text carries no edits. Sent as an edit, the worker would parse it
@@ -291,15 +304,50 @@ impl EditorShared {
         (start < end).then_some(start..end)
     }
 
-    /// The line at the top of what is drawn.
+    /// The row at the top of what is drawn.
     ///
-    /// A windowed view is pinned to its first line: there is nothing above it to scroll to, so
-    /// everything drawn is measured from there rather than from a scroll position nothing moves.
+    /// A row is one line height of content, and a block counts as its height in rows; without
+    /// blocks the row is the line. A windowed view is pinned to its first line: there is nothing
+    /// above it to scroll to, so everything drawn is measured from there rather than from a
+    /// scroll position nothing moves.
     pub fn top_line(&self) -> f64 {
         match self.line_window() {
-            Some(window) => window.start as f64,
+            Some(window) => self.row_of_line(window.start),
             None => self.scroll.pos.line,
         }
+    }
+
+    /// How tall one line is, in device pixels, as the row arithmetic takes it.
+    fn row_height(&self) -> f64 {
+        f64::from(self.metrics.line_height.max(1.0))
+    }
+
+    /// The row the top of `line` sits at: the lines above it and the room under them.
+    pub fn row_of_line(&self, line: usize) -> f64 {
+        line as f64 + self.blocks.above(line) / self.row_height()
+    }
+
+    /// The line at `row`, or the line above the block `row` is in.
+    pub fn line_at_row(&self, row: f64) -> usize {
+        self.blocks
+            .line_at(row * self.row_height(), self.row_height())
+            .min(self.line_count().saturating_sub(1))
+    }
+
+    /// How many rows the whole content takes: every line and every block.
+    pub fn total_rows(&self) -> f64 {
+        self.line_count() as f64 + self.blocks.total() / self.row_height()
+    }
+
+    /// How many rows the lines of `window` take, with the blocks under them.
+    pub fn window_rows(&self, window: &Range<usize>) -> f64 {
+        window.len() as f64 + self.blocks.within(window.clone()) / self.row_height()
+    }
+
+    /// How tall a windowed view's lines are, with their blocks, in device pixels.
+    pub fn window_height(&self) -> Option<f32> {
+        let window = self.line_window()?;
+        Some((self.window_rows(&window) * self.row_height()) as f32)
     }
 
     /// How many whole lines the viewport shows inside its padding.
@@ -331,7 +379,7 @@ impl EditorShared {
             // every scroll gesture that asks the bar about one is answered with nothing.
             total: self
                 .line_window()
-                .map_or_else(|| self.line_count(), |window| window.len()),
+                .map_or_else(|| self.total_rows(), |window| self.window_rows(&window)),
             viewport: self.viewport_lines(),
         }
     }
@@ -419,8 +467,13 @@ impl EditorShared {
 
     /// The top of `line`, in device pixels from the padding box's top.
     pub fn line_y(&self, line: usize) -> f32 {
-        let below = (line as f64 - self.top_line()) * f64::from(self.metrics.line_height);
+        let below = (self.row_of_line(line) - self.top_line()) * self.row_height();
         self.insets.top + below as f32
+    }
+
+    /// How far down the content `y` device pixels from the padding box's top is.
+    fn content_y(&self, y: f32) -> f64 {
+        self.top_line() * self.row_height() + f64::from(y - self.insets.top)
     }
 
     /// The lines any part of which is on screen.
@@ -431,12 +484,119 @@ impl EditorShared {
             return window;
         }
         let total = self.line_count();
-        // The top padding shows the lines above the top line.
-        let above = f64::from(self.insets.top) / f64::from(self.metrics.line_height);
-        let first = (self.scroll.pos.line - above).floor().max(0.0) as usize;
-        let rows =
-            (f64::from(self.viewport.1) / f64::from(self.metrics.line_height)).ceil() as usize + 1;
-        first.min(total)..(first + rows).min(total)
+        // The top padding shows the lines above the top line. A block across the top edge
+        // counts its own line in, which is drawn a little above what can be seen.
+        let line_height = self.row_height();
+        let first = self.blocks.line_at(self.content_y(0.0), line_height);
+        let last = self
+            .blocks
+            .line_at(self.content_y(self.viewport.1), line_height);
+        first.min(total)..(last + 2).min(total)
+    }
+
+    /// The block at `(x, y)` element-local device pixels, when the place is in one.
+    ///
+    /// Only the room between the lines counts: a block under a line a window does not draw is
+    /// not on screen, and neither is anything outside the element.
+    pub fn block_at(&self, x: f32, y: f32) -> Option<crate::block::BlockId> {
+        if self.blocks.is_empty() || x < 0.0 || x > self.viewport.0 {
+            return None;
+        }
+        let Spot::Block(index) = self.blocks.locate(self.content_y(y), self.row_height()) else {
+            return None;
+        };
+        let placed = self.blocks.placed()[index];
+        self.visible_lines()
+            .contains(&placed.after_line)
+            .then_some(placed.id)
+    }
+
+    /// Where every block on screen is, in CSS pixels from the padding box's corner.
+    ///
+    /// Only the blocks under the lines on screen are looked at, so the cost is what is visible.
+    /// A block counts as on screen while any of it is inside the padding box; one with no height
+    /// counts while its place is, so content mounted to be measured has a place to be measured at.
+    pub fn block_rects(&self) -> Vec<BlockRect> {
+        if self.blocks.is_empty() {
+            return Vec::new();
+        }
+        let scale = self.metrics.scale.max(0.001);
+        let line_height = self.row_height();
+        let top = self.top_line() * line_height;
+        let left = self.text_left();
+        let right_room = self.insets.right.max(self.scrollbar_width());
+        let width = (self.viewport.0 - left - right_room).max(0.0);
+        let mut rects = Vec::new();
+        for index in self.blocks.indices_within(self.visible_lines()) {
+            let placed = self.blocks.placed()[index];
+            let y = f64::from(self.insets.top) + self.blocks.top_of(index, line_height) - top;
+            let bottom = y + placed.height;
+            if bottom < 0.0 || y > f64::from(self.viewport.1) {
+                continue;
+            }
+            rects.push(BlockRect {
+                id: placed.id,
+                line: placed.after_line,
+                x: left / scale,
+                y: y as f32 / scale,
+                width: width / scale,
+                height: placed.height as f32 / scale,
+            });
+        }
+        rects
+    }
+
+    /// Replaces the blocks of the layer called `layer`. Answers whether anything is different.
+    ///
+    /// The text at the top of the view stays there: a block above it that grows moves the scroll
+    /// position down by as much, which is what keeps a thread being typed into below the view from
+    /// pushing the text being read.
+    pub fn set_blocks(&mut self, layer: &str, blocks: Vec<Block>) -> bool {
+        let anchor = self.top_anchor();
+        let (scale, total) = (self.metrics.scale, self.line_count());
+        if !self.blocks.set(layer, blocks, scale, total) {
+            return false;
+        }
+        self.keep_anchor(anchor);
+        true
+    }
+
+    /// Removes the block layer called `layer`. Answers whether anything is different.
+    pub fn clear_blocks(&mut self, layer: &str) -> bool {
+        let anchor = self.top_anchor();
+        let (scale, total) = (self.metrics.scale, self.line_count());
+        if !self.blocks.clear(layer, scale, total) {
+            return false;
+        }
+        self.keep_anchor(anchor);
+        true
+    }
+
+    /// The line at the top of a scrolled view, and how many rows below that line's top the view
+    /// starts.
+    fn top_anchor(&self) -> Option<(usize, f64)> {
+        if self.line_window().is_some() {
+            return None;
+        }
+        let top = self.scroll.pos.line;
+        let line = self.line_at_row(top);
+        Some((line, top - self.row_of_line(line)))
+    }
+
+    /// Puts the line of `anchor` back at the top, by as far below its top as it was, inside what
+    /// the line and its blocks take now. The glide keeps its distance to go.
+    fn keep_anchor(&mut self, anchor: Option<(usize, f64)>) {
+        let Some((line, offset)) = anchor else {
+            return;
+        };
+        let band = self.row_of_line(line + 1) - self.row_of_line(line);
+        let top = self.row_of_line(line) + offset.clamp(0.0, band.max(0.0));
+        let shift = top - self.scroll.pos.line;
+        let (total, viewport) = (self.total_rows(), self.viewport_lines());
+        let target = self.scroll.target_line + shift;
+        self.scroll.scroll_to(top, total, viewport);
+        self.scroll.target_line =
+            target.clamp(0.0, crate::scroll::ScrollState::max_top(total, viewport));
     }
 
     // ---- Style -------------------------------------------------------------------------
@@ -528,6 +688,8 @@ impl EditorShared {
             }
         }
         self.resolve_looks();
+        // Block heights are whole device pixels, so a new scale rounds them again.
+        self.blocks.ensure(self.metrics.scale, self.line_count());
 
         if !final_pass {
             return;
@@ -562,7 +724,7 @@ impl EditorShared {
             self.reported = Some(report);
             // The view stays inside the document at its new height. This frame paints at that
             // height, so the scroll position is clamped before the paint.
-            let total = self.line_count();
+            let total = self.total_rows();
             let lines = self.viewport_lines();
             let top = self.scroll.pos.line;
             self.scroll.scroll_to(top, total, lines);
@@ -824,12 +986,17 @@ impl EditorShared {
     }
 
     /// The byte a pointer at `(x, y)` element-local device pixels lands on.
+    ///
+    /// A place in a block lands on the line the block is under, so a drag that crosses a block
+    /// goes on selecting. A press that should not move the caret asks
+    /// [`block_at`](Self::block_at) first.
     pub fn hit_test(&mut self, x: f32, y: f32) -> usize {
         let rope = self.rope();
         let total = position::line_count(&rope);
-        let below = f64::from(y - self.insets.top) / f64::from(self.metrics.line_height);
-        let line_f = self.top_line() + below;
-        let line = (line_f.max(0.0) as usize).min(total.saturating_sub(1));
+        let line = self
+            .blocks
+            .line_at(self.content_y(y), self.row_height())
+            .min(total.saturating_sub(1));
         let start = position::line_start(&rope, line);
         let text_x = x - self.text_left() + self.scroll.pos.x_px as f32;
         if text_x <= 0.0 {
@@ -1765,7 +1932,7 @@ mod tests {
         let mut shared = padded(&"line\n".repeat(100), None, TWELVE);
         let total = shared.line_count();
         shared.scroll.pos.line =
-            crate::scroll::ScrollState::max_top(total, shared.viewport_lines());
+            crate::scroll::ScrollState::max_top(total as f64, shared.viewport_lines());
         let bottom = shared.line_y(total - 1) + shared.metrics.line_height;
         assert!(
             (bottom - (shared.viewport.1 - 12.0)).abs() < 1e-3,
@@ -1906,7 +2073,7 @@ mod tests {
         let line = shared.metrics.line_height;
         shared.read_style(&style, 1.0, (400.0, 10.0 * line), true);
         let bottom = |shared: &EditorShared| {
-            crate::scroll::ScrollState::max_top(shared.line_count(), shared.viewport_lines())
+            crate::scroll::ScrollState::max_top(shared.total_rows(), shared.viewport_lines())
         };
         shared.scroll.pos.line = bottom(&shared);
         let was = shared.scroll.pos.line;
