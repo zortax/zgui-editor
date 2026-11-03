@@ -1877,6 +1877,7 @@ mod tests {
     use zgui::elements::kurbo::{PathEl, Shape as _};
 
     use super::{EditorShared, Insets, underline_stroke};
+    use crate::block::{Block, BlockId};
     use crate::config::EditorConfig;
     use crate::decoration::UnderlineStyle;
     use crate::document::Document;
@@ -2135,6 +2136,218 @@ mod tests {
         assert_eq!(shared.line_window(), None);
         let past = windowed("a\nb\nc\n", Some(9..12));
         assert_eq!(past.line_window(), None);
+    }
+
+    /// Room `height` device pixels tall under `line`, in a layer of its own.
+    fn with_block(shared: &mut EditorShared, id: u64, line: usize, height: f32) {
+        shared.set_blocks(
+            &format!("layer-{id}"),
+            vec![Block::new(BlockId(id), line, height)],
+        );
+    }
+
+    /// The ids of the blocks that have a rectangle right now.
+    fn on_screen(shared: &EditorShared) -> Vec<u64> {
+        shared.block_rects().iter().map(|rect| rect.id.0).collect()
+    }
+
+    #[test]
+    fn a_block_moves_the_lines_below_it_down_and_no_others() {
+        let mut shared = windowed(&"line\n".repeat(100), None);
+        with_block(&mut shared, 1, 2, 50.0);
+        assert_eq!(shared.line_y(2), 40.0, "the line the block is under stays");
+        assert_eq!(
+            shared.line_y(3),
+            110.0,
+            "the next line starts below the block"
+        );
+        assert_eq!(shared.row_of_line(3), 5.5);
+        assert_eq!(shared.total_rows(), 101.0 + 2.5);
+    }
+
+    #[test]
+    fn a_scrolled_view_counts_the_blocks_above_its_top() {
+        let mut shared = windowed(&"line\n".repeat(100), None);
+        with_block(&mut shared, 1, 2, 50.0);
+        shared.scroll.pos.line = shared.row_of_line(10);
+        assert_eq!(shared.line_y(10), 0.0, "line ten is the top line");
+        assert_eq!(shared.visible_lines().start, 10);
+
+        // Two rows into the block's room: the block's own line is still drawn, above the edge.
+        shared.scroll.pos.line = 4.0;
+        assert_eq!(shared.visible_lines().start, 2);
+        assert_eq!(shared.line_y(2), -40.0);
+        assert_eq!(shared.line_y(3), 30.0);
+        assert_eq!(
+            shared.line_at_row(4.0),
+            2,
+            "a row in a block belongs to its line"
+        );
+    }
+
+    #[test]
+    fn the_view_shows_as_many_lines_as_the_blocks_leave_room_for() {
+        let mut shared = windowed(&"line\n".repeat(100), None);
+        let bare = shared.visible_lines();
+        with_block(&mut shared, 1, 2, 200.0);
+        let roomy = shared.visible_lines();
+        assert_eq!(roomy.start, bare.start);
+        assert!(
+            roomy.end + 10 <= bare.end + 1,
+            "ten lines' room fewer lines: {bare:?} then {roomy:?}"
+        );
+    }
+
+    #[test]
+    fn a_press_in_a_block_finds_it_and_lands_on_its_line() {
+        let mut shared = windowed(&"line\n".repeat(100), None);
+        with_block(&mut shared, 1, 2, 50.0);
+        assert_eq!(shared.block_at(100.0, 60.0), Some(BlockId(1)));
+        assert_eq!(shared.block_at(100.0, 109.0), Some(BlockId(1)));
+        assert_eq!(shared.block_at(100.0, 59.0), None, "line two");
+        assert_eq!(shared.block_at(100.0, 110.0), None, "line three");
+        assert_eq!(shared.block_at(-1.0, 70.0), None, "outside the element");
+        assert_eq!(shared.hit_test(0.0, 70.0), 10, "the start of line two");
+        assert_eq!(shared.hit_test(0.0, 115.0), 15, "the start of line three");
+    }
+
+    #[test]
+    fn scrolled_to_the_end_the_last_line_is_at_the_bottom_with_blocks_above_it() {
+        let mut shared = windowed(&"line\n".repeat(100), None);
+        with_block(&mut shared, 1, 50, 70.0);
+        with_block(&mut shared, 2, 60, 13.0);
+        shared.scroll.pos.line =
+            crate::scroll::ScrollState::max_top(shared.total_rows(), shared.viewport_lines());
+        let last = shared.line_count() - 1;
+        assert_eq!(
+            shared.line_y(last) + shared.metrics.line_height,
+            shared.viewport.1
+        );
+    }
+
+    #[test]
+    fn the_scrollbar_counts_the_room_of_the_blocks() {
+        let mut shared = windowed(&"line\n".repeat(10), None);
+        assert!(shared.scrollbar().thumb(0.0).is_none(), "eleven lines fit");
+        with_block(&mut shared, 1, 3, 400.0);
+        assert_eq!(shared.scrollbar().total, 31.0);
+        assert!(
+            shared.scrollbar().thumb(0.0).is_some(),
+            "thirty-one rows do not"
+        );
+    }
+
+    #[test]
+    fn a_window_is_as_tall_as_its_lines_and_the_blocks_under_them() {
+        let mut shared = windowed("a\nb\nc\nd\ne\n", Some(1..3));
+        with_block(&mut shared, 1, 0, 100.0);
+        with_block(&mut shared, 2, 2, 30.0);
+        with_block(&mut shared, 3, 3, 100.0);
+        assert_eq!(
+            shared.window_height(),
+            Some(70.0),
+            "two lines, and the block under the window's last line"
+        );
+        assert_eq!(
+            shared.line_y(1),
+            0.0,
+            "a block above the window takes no room"
+        );
+        assert_eq!(shared.line_y(2), 20.0);
+        assert_eq!(
+            on_screen(&shared),
+            [2],
+            "only the window's blocks are drawn"
+        );
+        assert_eq!(shared.block_rects()[0].y, 40.0);
+    }
+
+    #[test]
+    fn a_block_rect_is_right_of_the_gutter_and_clear_of_the_scrollbar() {
+        let mut shared = windowed(&"line\n".repeat(100), None);
+        with_block(&mut shared, 1, 2, 50.0);
+        let rect = shared.block_rects()[0];
+        let gutter = shared.gutter_width();
+        assert_eq!(rect.id, BlockId(1));
+        assert_eq!(rect.line, 2);
+        assert_eq!((rect.x, rect.y, rect.height), (gutter, 60.0, 50.0));
+        assert_eq!(rect.width, 400.0 - gutter - shared.scrollbar_width());
+
+        let mut padded = padded(&"line\n".repeat(100), None, TWELVE);
+        with_block(&mut padded, 1, 2, 50.0);
+        let rect = padded.block_rects()[0];
+        assert_eq!((rect.x, rect.y), (12.0 + gutter, 72.0));
+        assert_eq!(rect.width, 400.0 - 12.0 - gutter - 12.0);
+    }
+
+    #[test]
+    fn a_block_rect_is_in_css_pixels() {
+        let mut shared = windowed(&"line\n".repeat(100), None);
+        shared.metrics.scale = 2.0;
+        shared.metrics.line_height = 40.0;
+        shared.set_blocks("review", vec![Block::new(BlockId(1), 2, 25.3)]);
+        let rect = shared.block_rects()[0];
+        assert_eq!(rect.y, 60.0, "three lines of twenty CSS pixels");
+        assert_eq!(
+            rect.height, 25.5,
+            "51 device pixels, a whole number of them"
+        );
+        assert_eq!(shared.line_y(3), 120.0 + 51.0);
+    }
+
+    #[test]
+    fn only_the_blocks_on_screen_have_rects() {
+        let mut shared = windowed(&"line\n".repeat(100), None);
+        with_block(&mut shared, 1, 5, 40.0);
+        with_block(&mut shared, 2, 50, 40.0);
+        with_block(&mut shared, 3, 90, 40.0);
+        assert_eq!(on_screen(&shared), [1]);
+        shared.scroll.pos.line = shared.row_of_line(45);
+        assert_eq!(on_screen(&shared), [2]);
+        // The block a little above the top edge is still partly on screen.
+        shared.scroll.pos.line = shared.row_of_line(51) - 1.0;
+        let rect = shared.block_rects()[0];
+        assert_eq!(rect.id, BlockId(2));
+        assert_eq!(rect.y, -20.0);
+        shared.scroll.pos.line = shared.row_of_line(53);
+        assert!(on_screen(&shared).is_empty());
+    }
+
+    #[test]
+    fn a_block_with_no_height_has_a_place_to_be_measured_at() {
+        let mut shared = windowed(&"line\n".repeat(100), None);
+        with_block(&mut shared, 1, 2, 0.0);
+        assert_eq!(shared.line_y(3), 60.0, "it takes no room");
+        let rect = shared.block_rects()[0];
+        assert_eq!((rect.y, rect.height), (60.0, 0.0));
+    }
+
+    #[test]
+    fn a_block_that_grows_above_the_view_keeps_the_text_at_the_top() {
+        let mut shared = windowed(&"line\n".repeat(100), None);
+        with_block(&mut shared, 1, 5, 40.0);
+        shared.scroll.pos.line = shared.row_of_line(30) + 0.25;
+        shared.scroll.target_line = shared.scroll.pos.line + 3.0;
+        let before = shared.line_y(30);
+        with_block(&mut shared, 1, 5, 100.0);
+        assert_eq!(shared.line_y(30), before, "the text being read stays put");
+        assert!(
+            (shared.scroll.target_line - shared.scroll.pos.line - 3.0).abs() < 1e-9,
+            "the glide keeps its distance to go"
+        );
+        shared.clear_blocks("layer-1");
+        assert_eq!(shared.line_y(30), before);
+        assert_eq!(shared.scroll.pos.line, 30.25);
+    }
+
+    #[test]
+    fn a_block_below_the_top_changes_nothing_above_it() {
+        let mut shared = windowed(&"line\n".repeat(100), None);
+        shared.scroll.pos.line = 10.0;
+        with_block(&mut shared, 1, 15, 100.0);
+        assert_eq!(shared.scroll.pos.line, 10.0);
+        assert_eq!(shared.line_y(15), 100.0);
+        assert_eq!(shared.line_y(16), 220.0);
     }
 
     #[test]
