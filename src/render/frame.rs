@@ -2,10 +2,12 @@
 //!
 //! The frame is the component's root. It reads its own padding and border, gives its padding box
 //! to the [`EditorElement`](crate::render::element::EditorElement) inside it, and stores the
-//! padding in [`EditorShared`]. The layer an application's [block](crate::block) content is
-//! mounted in, when there is one, gets the same box over the element. The editor then draws the way a CSS scroll container does: the
+//! padding in [`EditorShared`]. The editor then draws the way a CSS scroll container does: the
 //! scrollbars at the padding box's edges, the text inset by the padding, and scrolled text
 //! moving through the padding up to the frame's clip.
+//!
+//! The layer an application's [block](crate::block) content is mounted in, when there is one, is
+//! the frame's second child and gets the same box, over the element.
 
 use std::cell::RefCell;
 use std::rc::Rc;
